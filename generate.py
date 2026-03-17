@@ -192,7 +192,7 @@ def process_member(token, member, tag_ids):
     intro_expiry_days = None
     if is_intro_mem:
         m = own_active_mems[0]
-        intro_classes_used = m.get('usedSessions') or 0
+        intro_classes_used = m.get('usedSessions', 0)
         intro_classes_total = m.get('usageLimitForSessions') or 3
         intro_classes_left = max(0, intro_classes_total - intro_classes_used)
         end_date = m.get('endDate', '')
@@ -344,7 +344,6 @@ def generate_html(members_data, tasks_today, tasks_week, stats):
     tj = json.dumps(tasks_today, ensure_ascii=False)
     wj = json.dumps(tasks_week, ensure_ascii=False)
     gh_repo = GH_REPO
-    gh_pat = GH_PAT
 
     return f'''<!DOCTYPE html>
 <html lang="es">
@@ -578,7 +577,7 @@ const MEMBERS={mj};
 const TASKS_TODAY={tj};
 const TASKS_WEEK={wj};
 const GH_REPO='{gh_repo}';
-const GH_PAT='{gh_pat}';
+const GH_ACTIONS_URL='https://github.com/estudio-arete/dashboard_acuerdo13_v2/actions/workflows/update.yml';
 let fT='',fW='';
 
 function toast(m,dur=2500){{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),dur);}}
@@ -601,29 +600,9 @@ function showSubtab(name, btn){{
   if(btn) btn.classList.add('active');
 }}
 
-async function triggerRefresh(){{
-  const btn = document.getElementById('refresh-btn');
-  const icon = document.getElementById('refresh-icon');
-  btn.classList.add('loading');
-  btn.disabled = true;
-  icon.textContent = '⏳';
-  toast('Actualizando datos desde Momence... puede tardar 5-10 minutos', 5000);
-  try{{
-    const r = await fetch(`https://api.github.com/repos/${{GH_REPO}}/actions/workflows/update.yml/dispatches`, {{
-      method: 'POST',
-      headers: {{'Authorization': `token ${{GH_PAT}}`,'Content-Type':'application/json','Accept':'application/vnd.github.v3+json'}},
-      body: JSON.stringify({{'ref':'main'}})
-    }});
-    if(r.status === 204){{
-      toast('✅ Actualización iniciada. El dashboard se recargará automáticamente en unos minutos.', 6000);
-      setTimeout(()=>location.reload(), 600000);
-    }} else {{
-      toast('Error al iniciar la actualización. Inténtalo de nuevo.');
-    }}
-  }} catch(e){{
-    toast('Error de conexión. Inténtalo de nuevo.');
-  }}
-  setTimeout(()=>{{btn.classList.remove('loading');btn.disabled=false;icon.textContent='↻';}}, 10000);
+function triggerRefresh(){{
+  window.open(GH_ACTIONS_URL, '_blank');
+  toast('Se abre GitHub Actions — haz clic en Run workflow');
 }}
 
 const TM={{
