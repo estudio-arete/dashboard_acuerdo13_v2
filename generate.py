@@ -1,7 +1,6 @@
 import requests
 import json
 import os
-from datetime import datetime
 
 CLIENT_ID = os.environ['MOMENCE_CLIENT_ID']
 CLIENT_SECRET = os.environ['MOMENCE_CLIENT_SECRET']
@@ -20,20 +19,27 @@ def get_token():
     r.raise_for_status()
     return r.json()['access_token']
 
-def api(token, path, params=None):
-    r = requests.get(f'{BASE}{path}', headers={'Authorization': f'Bearer {token}'}, params=params or {})
+def get(token, path):
+    r = requests.get(f'{BASE}{path}', headers={'Authorization': f'Bearer {token}'})
+    r.raise_for_status()
+    return r.json()
+
+def post(token, path, body=None):
+    r = requests.post(f'{BASE}{path}', headers={'Authorization': f'Bearer {token}'}, json=body or {})
     r.raise_for_status()
     return r.json()
 
 print('Autenticando...')
 token = get_token()
-print('Token obtenido correctamente')
+print('Token obtenido')
 
-members = api(token, '/api/v2/host/members', {'limit': 10})
-print(f'Respuesta members: {json.dumps(members, indent=2, ensure_ascii=False)[:1000]}')
+# GET sin parámetros
+print('Probando GET /host/members...')
+members_get = get(token, '/api/v2/host/members')
+print('GET respuesta:', json.dumps(members_get, indent=2, ensure_ascii=False)[:500])
 
 os.makedirs('output', exist_ok=True)
 with open('output/index.html', 'w') as f:
-    f.write('<html><body><h1>arete OK</h1><p>API conectada correctamente</p></body></html>')
+    f.write('<html><body><h1>arete OK</h1><pre>' + json.dumps(members_get, indent=2, ensure_ascii=False)[:2000] + '</pre></body></html>')
 
 print('Listo')
