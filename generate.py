@@ -25,20 +25,14 @@ print('Token obtenido')
 
 headers = {'Authorization': f'Bearer {token}'}
 
-# Probar POST /host/members/list
-print('Probando POST /host/members/list...')
-r = requests.post(f'{BASE}/api/v2/host/members/list', headers=headers, json={})
+# GET con paginación
+print('Probando GET /host/members con paginación...')
+r = requests.get(f'{BASE}/api/v2/host/members', headers=headers, params={'page': 0, 'pageSize': 10})
 print('Status:', r.status_code)
-print('Respuesta:', r.text[:1000])
-
-# Probar GET con detalle del error
-print('\nProbando GET /host/members...')
-r2 = requests.get(f'{BASE}/api/v2/host/members', headers=headers)
-print('Status:', r2.status_code)
-print('Respuesta:', r2.text[:1000])
+print('Respuesta:', r.text[:2000])
 
 os.makedirs('output', exist_ok=True)
 with open('output/index.html', 'w') as f:
-    f.write('<html><body><h1>Debug</h1></body></html>')
+    f.write('<html><body><pre>' + r.text[:5000] + '</pre></body></html>')
 
 print('Listo')
