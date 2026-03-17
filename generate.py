@@ -19,27 +19,26 @@ def get_token():
     r.raise_for_status()
     return r.json()['access_token']
 
-def get(token, path):
-    r = requests.get(f'{BASE}{path}', headers={'Authorization': f'Bearer {token}'})
-    r.raise_for_status()
-    return r.json()
-
-def post(token, path, body=None):
-    r = requests.post(f'{BASE}{path}', headers={'Authorization': f'Bearer {token}'}, json=body or {})
-    r.raise_for_status()
-    return r.json()
-
 print('Autenticando...')
 token = get_token()
 print('Token obtenido')
 
-# GET sin parámetros
-print('Probando GET /host/members...')
-members_get = get(token, '/api/v2/host/members')
-print('GET respuesta:', json.dumps(members_get, indent=2, ensure_ascii=False)[:500])
+headers = {'Authorization': f'Bearer {token}'}
+
+# Probar POST /host/members/list
+print('Probando POST /host/members/list...')
+r = requests.post(f'{BASE}/api/v2/host/members/list', headers=headers, json={})
+print('Status:', r.status_code)
+print('Respuesta:', r.text[:1000])
+
+# Probar GET con detalle del error
+print('\nProbando GET /host/members...')
+r2 = requests.get(f'{BASE}/api/v2/host/members', headers=headers)
+print('Status:', r2.status_code)
+print('Respuesta:', r2.text[:1000])
 
 os.makedirs('output', exist_ok=True)
 with open('output/index.html', 'w') as f:
-    f.write('<html><body><h1>arete OK</h1><pre>' + json.dumps(members_get, indent=2, ensure_ascii=False)[:2000] + '</pre></body></html>')
+    f.write('<html><body><h1>Debug</h1></body></html>')
 
 print('Listo')
