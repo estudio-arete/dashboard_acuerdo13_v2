@@ -192,7 +192,7 @@ def process_member(token, member, tag_ids):
     intro_expiry_days = None
     if is_intro_mem:
         m = own_active_mems[0]
-        intro_classes_used = m.get('usedSessions', 0)
+        intro_classes_used = m.get('usedSessions') or 0
         intro_classes_total = m.get('usageLimitForSessions') or 3
         intro_classes_left = max(0, (intro_classes_total or 0) - (intro_classes_used or 0))
         end_date = m.get('endDate', '')
@@ -307,8 +307,8 @@ def build_tasks(members_data):
             key = f"{email}_intro_journey"
             if key not in seen:
                 seen.add(key)
-                left = m['intro_classes_left']
-                used = m['intro_classes_used']
+                left = m['intro_classes_left'] or 0
+                used = m['intro_classes_used'] or 0
                 if left == 0:
                     urgency = 1
                     action = 'URGENTE — No le quedan clases. Contactar hoy para convertir'
@@ -692,9 +692,9 @@ function renderRefrescar(){{
 function renderIntro(){{
   const intros = MEMBERS.filter(m=>m.is_intro&&!m.is_platform).sort((a,b)=>a.intro_classes_left-b.intro_classes_left);
   document.getElementById('body-intro').innerHTML = intros.length ? intros.map(m=>{{
-    const left = m.intro_classes_left;
-    const used = m.intro_classes_used;
-    const total = m.intro_classes_total;
+    const left = m.intro_classes_left || 0;
+    const used = m.intro_classes_used || 0;
+    const total = m.intro_classes_total || 3;
     let urgLabel, urgCls;
     if(left===0){{urgLabel='🔴 Sin clases — URGENTE';urgCls='p-danger';}}
     else if(left===1){{urgLabel='🟠 1 restante — HABLAR HOY';urgCls='p-warn';}}
