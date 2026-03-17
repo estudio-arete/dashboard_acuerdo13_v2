@@ -125,8 +125,27 @@ def fetch_all_sessions(token, mid):
     return past, future
 
 def fetch_notes(token, mid):
-    data = api_get(token, f'/api/v2/host/members/{mid}/notes', {'page': 0, 'pageSize': 3})
+    data = api_get(token, f'/api/v2/host/members/{mid}/notes', {'page': 0, 'pageSize': 5})
     return data.get('payload', [])
+
+def format_notes(notes):
+    result = []
+    for n in notes[:3]:
+        content_text = n.get('content', '').strip()
+        created = n.get('createdAt', '')
+        if content_text:
+            date_str = ''
+            if created:
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    madrid = ZoneInfo('Europe/Madrid')
+                    dt_madrid = dt.astimezone(madrid)
+                    date_str = dt_madrid.strftime('%d/%m/%y')
+                except:
+                    pass
+            result.append({'content': content_text, 'date': date_str})
+    return result
 
 def assign_tag(token, mid, tag_id):
     return api_post(token, f'/api/v2/host/members/{mid}/tags', {'tagId': tag_id})
@@ -302,8 +321,20 @@ def process_member(token, member, tag_ids):
             except: pass
         membership_summary = ' · '.join(parts)
 
-    last_note = notes[0].get('content', '') if notes else ''
+    last_note = notes[0].get('content', '').strip() if notes else ''
+    formatted_notes = format_notes(notes)
     has_pm = 'PM' in tag_names or 'MANUAL' in tag_names or 'CASH' in tag_names
+
+    # MRR calculation - sum of all active subscription amounts
+    mrr = 0.0
+    for m in own_active_mems:
+        if is_subscription(m):
+            # Get renewal amount from membership
+            price = m.get('membership', {}).get('price', 0) or 0
+            try:
+                mrr += float(price)
+            except:
+                pass
 
     return {
         'id': mid,
@@ -327,6 +358,7 @@ def process_member(token, member, tag_ids):
         'new_member_purchase': new_member_purchase,
         'is_manual_cash': 'MANUAL' in tag_names or 'CASH' in tag_names,
         'has_pm': has_pm,
+        'mrr': mrr,
         'membership_summary': membership_summary,
         'renewal_days': renewal_days,
         'next_class': next_class,
@@ -340,6 +372,7 @@ def process_member(token, member, tag_ids):
         'intro_classes_left': intro_classes_left,
         'intro_expiry_days': intro_expiry_days,
         'last_note': last_note,
+        'formatted_notes': formatted_notes,
         'momence_url': f'{MOMENCE_CRM}/{mid}',
         'momence_notes_url': f'{MOMENCE_CRM}/{mid}#?tab=notes',
         'added_tags': add_tags,
@@ -369,6 +402,7 @@ def build_tasks(members_data):
                     'prev_class': None, 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
                     'priority': 1, 'sd': nc_days if nc_days is not None else 0
@@ -389,6 +423,7 @@ def build_tasks(members_data):
                     'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
                     'priority': 2, 'sd': nc_days if nc_days is not None else 99
@@ -410,6 +445,7 @@ def build_tasks(members_data):
                     'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
                     'priority': 2, 'sd': 0
@@ -433,6 +469,7 @@ def build_tasks(members_data):
                             'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                             'next_coach': m['next_coach'],
                             'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                             'momence_url': m['momence_url'],
                             'momence_notes_url': m['momence_notes_url'],
                             'priority': 2, 'sd': days_to_class
@@ -457,6 +494,7 @@ def build_tasks(members_data):
                     'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
                     'priority': 3, 'sd': nc_days if nc_days is not None else 99
@@ -489,12 +527,15 @@ def build_tasks(members_data):
                     'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
+                    'formatted_notes': m.get('formatted_notes', []),
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
                     'priority': urgency, 'sd': nc_days if nc_days is not None else 99
                 }
-                if nc_days == 0: tasks_today.append(item)
-                else: tasks_week.append(item)
+                if nc_days is not None and nc_days == 0:
+                    tasks_today.append(item)
+                else:
+                    tasks_week.append(item)
 
     tasks_today.sort(key=lambda x: x['priority'])
     tasks_week.sort(key=lambda x: (x.get('sd', 99), x['priority']))
@@ -504,6 +545,7 @@ def generate_html(members_data, tasks_today, tasks_week, stats):
     mj = json.dumps([m for m in members_data if m], ensure_ascii=False)
     tj = json.dumps(tasks_today, ensure_ascii=False)
     wj = json.dumps(tasks_week, ensure_ascii=False)
+    mrr_breakdown_json = json.dumps(stats.get('mrr_breakdown', {}), ensure_ascii=False)
     gh_actions_url = f'https://github.com/{GH_REPO}/actions/workflows/update.yml'
 
     return f'''<!DOCTYPE html>
@@ -523,13 +565,13 @@ body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sa
 .brand em{{font-weight:300;color:#847366;font-size:11px;margin-left:10px;font-style:normal;letter-spacing:0.04em}}
 .update-info{{font-size:10px;color:#847366;margin-top:2px}}
 .topbar-actions{{display:flex;gap:6px;align-items:center}}
-.btn-refresh{{font-size:11px;padding:6px 14px;border:1px solid #8e352d;border-radius:4px;background:#8e352d;color:#fff;cursor:pointer;letter-spacing:0.03em;font-family:inherit}}
-.btn-refresh:hover{{background:#7a2d26}}
+.btn-refresh{{font-size:11px;padding:6px 14px;border:1px solid #27303d;border-radius:4px;background:#27303d;color:#fff;cursor:pointer;letter-spacing:0.03em;font-family:inherit}}
+.btn-refresh:hover{{background:#1e2530}}
 .metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:1rem}}
 .metric{{background:#fff;border-radius:4px;padding:0.75rem;text-align:center;border:1px solid #ebebeb}}
 .metric .n{{font-size:24px;font-weight:300;line-height:1.2;letter-spacing:-0.02em}}
 .metric .l{{font-size:10px;color:#847366;margin-top:3px;letter-spacing:0.03em}}
-.red .n{{color:#8e352d}}.amber .n{{color:#854f0b}}.green .n{{color:#3b6d11}}.blue .n{{color:#27303d}}
+.red .n{{color:#222323}}.amber .n{{color:#854f0b}}.green .n{{color:#3b6d11}}.blue .n{{color:#27303d}}
 .prog-wrap{{background:#fff;border-radius:4px;padding:0.85rem 1.25rem;margin-bottom:1rem;border:1px solid #ebebeb}}
 .prog-label{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}}
 .prog-label span{{font-size:11px;color:#847366;letter-spacing:0.03em}}
@@ -539,11 +581,11 @@ body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sa
 .tabs-wrap{{background:#fff;border-radius:4px;border:1px solid #ebebeb;overflow:hidden}}
 .tabs{{display:flex;border-bottom:1px solid #ebebeb;overflow-x:auto}}
 .tab{{font-size:11px;padding:10px 16px;cursor:pointer;color:#847366;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap;background:#fff;letter-spacing:0.03em;font-weight:400}}
-.tab.active{{color:#222323;font-weight:500;border-bottom-color:#8e352d}}
+.tab.active{{color:#222323;font-weight:500;border-bottom-color:#222323}}
 .tab:hover{{color:#222323}}
 .tab-content{{display:none;padding:1.25rem}}
 .tab-content.active{{display:block}}
-.badge{{font-size:9px;background:#f7eded;color:#8e352d;padding:1px 5px;border-radius:100px;margin-left:3px;letter-spacing:0.02em}}
+.badge{{font-size:9px;background:#ebebeb;color:#222323;padding:1px 5px;border-radius:100px;margin-left:3px;letter-spacing:0.02em}}
 .badge.w{{background:#fdf6ec;color:#854f0b}}.badge.i{{background:#eef3f8;color:#27303d}}.badge.g{{background:#edf5e8;color:#3b6d11}}
 .section-hdr{{display:flex;align-items:center;justify-content:space-between;margin-bottom:0.75rem}}
 .section-title{{font-size:12px;font-weight:500;letter-spacing:0.04em;color:#222323}}
@@ -553,7 +595,7 @@ body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sa
 .fb.active{{background:#222323;color:#fff;border-color:#222323}}
 .task-list{{display:flex;flex-direction:column;gap:6px;margin-bottom:1rem}}
 .task{{display:flex;gap:12px;padding:12px 14px;border:1px solid #ebebeb;border-radius:4px;background:#fff}}
-.task.urg{{border-left:2px solid #8e352d;padding-left:12px}}
+.task.urg{{border-left:2px solid #222323;padding-left:12px}}
 .task.warn{{border-left:2px solid #c4832a;padding-left:12px}}
 .task.info{{border-left:2px solid #27303d;padding-left:12px}}
 .task.ok-t{{border-left:2px solid #3b6d11;padding-left:12px}}
@@ -561,14 +603,14 @@ body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sa
 .task-top{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}}
 .tname{{font-size:13px;font-weight:500}}
 .tname a{{color:#222323;text-decoration:none}}
-.tname a:hover{{color:#8e352d}}
+.tname a:hover{{color:#27303d}}
 .tpill{{font-size:9px;padding:2px 7px;border-radius:100px;white-space:nowrap;letter-spacing:0.03em;font-weight:500}}
-.tp1{{background:#f7eded;color:#8e352d}}.tp2{{background:#fdf6ec;color:#854f0b}}
+.tp1{{background:#f0f0f0;color:#222323}}.tp2{{background:#fdf6ec;color:#854f0b}}
 .tp3{{background:#eef3f8;color:#27303d}}.tp4{{background:#f2f0fd;color:#3c3489}}
 .tp5{{background:#f5f5f5;color:#847366}}.tp-new{{background:#edf5e8;color:#3b6d11}}
 .tdetail{{font-size:11px;color:#847366;margin-bottom:4px;line-height:1.5}}
 .taction{{font-size:12px;font-weight:500;line-height:1.4}}
-.taction.r{{color:#8e352d}}.taction.a{{color:#854f0b}}.taction.b{{color:#27303d}}.taction.g{{color:#3b6d11}}
+.taction.r{{color:#222323}}.taction.a{{color:#854f0b}}.taction.b{{color:#27303d}}.taction.g{{color:#3b6d11}}
 .tmeta{{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}}
 .tclass{{font-size:10px;color:#847366;padding:2px 8px;border:1px solid #ebebeb;border-radius:100px;background:#fafafa}}
 .tcoach{{font-size:10px;color:#847366;padding:2px 8px;border:1px solid #ebebeb;border-radius:100px;background:#fafafa}}
@@ -577,7 +619,7 @@ body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sa
 .tnote-actions{{display:flex;gap:8px;align-items:center}}
 .tnote-input{{font-size:11px;padding:4px 8px;border:1px solid #ebebeb;border-radius:4px;background:#fff;color:#222323;width:200px;font-family:inherit}}
 .tnote-input:focus{{outline:none;border-color:#847366}}
-.note-link{{font-size:10px;color:#8e352d;text-decoration:none;letter-spacing:0.02em}}
+.note-link{{font-size:10px;color:#27303d;text-decoration:none;letter-spacing:0.02em}}
 .note-link:hover{{text-decoration:underline}}
 .toolbar{{display:flex;align-items:center;gap:8px;margin-bottom:0.75rem;flex-wrap:wrap}}
 .search{{font-size:12px;padding:6px 10px;border:1px solid #ebebeb;border-radius:4px;background:#fff;color:#222323;width:200px;font-family:inherit}}
@@ -590,15 +632,15 @@ tr:last-child td{{border-bottom:none}}
 tr:hover td{{background:#fafafa}}
 .pill{{display:inline-block;font-size:9px;padding:2px 7px;border-radius:100px;font-weight:500;white-space:nowrap;margin:1px;letter-spacing:0.03em}}
 .p-ok{{background:#edf5e8;color:#3b6d11}}.p-warn{{background:#fdf6ec;color:#854f0b}}
-.p-danger{{background:#f7eded;color:#8e352d}}.p-info{{background:#eef3f8;color:#27303d}}
+.p-danger{{background:#f0f0f0;color:#222323}}.p-info{{background:#eef3f8;color:#27303d}}
 .p-grey{{background:#f5f5f5;color:#847366}}.p-dark{{background:#222323;color:#fff}}
 .member-link{{color:#222323;text-decoration:none;font-weight:500}}
-.member-link:hover{{color:#8e352d}}
+.member-link:hover{{color:#27303d}}
 .subtabs{{display:flex;gap:4px;margin-bottom:0.75rem}}
 .stab{{font-size:11px;padding:4px 12px;border:1px solid #ebebeb;border-radius:4px;cursor:pointer;background:#fff;color:#847366;font-family:inherit}}
-.stab.active{{background:#222323;color:#fff;border-color:#222323}}
+.stab.active{{background:#27303d;color:#fff;border-color:#27303d}}
 .briefing-box{{background:#fafafa;border-radius:4px;padding:1.25rem;font-size:12px;line-height:1.9;white-space:pre-wrap;border:1px solid #ebebeb;min-height:220px;margin-bottom:0.75rem;font-family:'Courier New',monospace;color:#222323}}
-.copy-btn{{width:100%;padding:9px;border:none;border-radius:4px;background:#222323;color:#fff;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:0.05em}}
+.copy-btn{{width:100%;padding:9px;border:none;border-radius:4px;background:#27303d;color:#fff;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:0.05em}}
 .copy-btn:hover{{background:#444}}
 .toast{{position:fixed;bottom:1.5rem;right:1.5rem;background:#222323;color:#fff;padding:10px 18px;border-radius:4px;font-size:11px;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:999;letter-spacing:0.03em}}
 .toast.show{{opacity:1}}
@@ -622,11 +664,11 @@ tr:hover td{{background:#fafafa}}
 
   <div class="metrics">
     <div class="metric green"><div class="n">{stats['active_members']}</div><div class="l">MEMBERS ACTIVOS</div></div>
+    <div class="metric green"><div class="n">{stats['total_mrr']:.0f}€</div><div class="l">MRR</div></div>
+    <div class="metric amber"><div class="n">{stats['mrr_at_risk']:.0f}€</div><div class="l">MRR EN RIESGO</div></div>
     <div class="metric red"><div class="n" id="m-hoy">—</div><div class="l">TAREAS HOY</div></div>
     <div class="metric amber"><div class="n" id="m-semana">—</div><div class="l">ESTA SEMANA</div></div>
-    <div class="metric red"><div class="n">{stats['no_payment_method']}</div><div class="l">SIN MÉTODO PAGO</div></div>
     <div class="metric blue"><div class="n">{stats['intro_count']}</div><div class="l">INTRO JOURNEY</div></div>
-    <div class="metric amber"><div class="n">{stats['new_members']}</div><div class="l">NUEVOS ESTA SEMANA</div></div>
   </div>
 
   <div class="prog-wrap">
@@ -645,6 +687,7 @@ tr:hover td{{background:#fafafa}}
       <div class="tab" onclick="showTab('members')">Members<span class="badge i">{stats['active_members']}</span></div>
       <div class="tab" onclick="showTab('intro')">Intro Journey<span class="badge i">{stats['intro_count']}</span></div>
       <div class="tab" onclick="showTab('potenciales')">Potenciales<span class="badge w">{stats['potenciales']}</span></div>
+      <div class="tab" onclick="showTab('economia')">Economía</div>
       <div class="tab" onclick="showTab('briefing')">Briefing</div>
     </div>
 
@@ -744,6 +787,30 @@ tr:hover td{{background:#fafafa}}
       </div>
     </div>
 
+    <div id="tab-economia" class="tab-content">
+      <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem;margin-bottom:1.5rem">
+        <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+          <div style="font-size:10px;color:#847366;letter-spacing:0.04em;margin-bottom:6px">MRR TOTAL</div>
+          <div style="font-size:32px;font-weight:300;letter-spacing:-0.02em;color:#222323">{stats['total_mrr']:.0f}<span style="font-size:16px;color:#847366">€</span></div>
+          <div style="font-size:11px;color:#847366;margin-top:4px">{stats['active_members']} suscripciones activas</div>
+        </div>
+        <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+          <div style="font-size:10px;color:#847366;letter-spacing:0.04em;margin-bottom:6px">MRR EN RIESGO</div>
+          <div style="font-size:32px;font-weight:300;letter-spacing:-0.02em;color:#222323">{stats['mrr_at_risk']:.0f}<span style="font-size:16px;color:#847366">€</span></div>
+          <div style="font-size:11px;color:#847366;margin-top:4px">{stats['no_payment_method']} members sin método de pago</div>
+        </div>
+        <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+          <div style="font-size:10px;color:#847366;letter-spacing:0.04em;margin-bottom:6px">LTV MEDIO</div>
+          <div style="font-size:32px;font-weight:300;letter-spacing:-0.02em;color:#222323">{stats['avg_ltv']:.0f}<span style="font-size:16px;color:#847366">€</span></div>
+          <div style="font-size:11px;color:#847366;margin-top:4px">Por member activo</div>
+        </div>
+      </div>
+      <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+        <div style="font-size:11px;font-weight:500;letter-spacing:0.04em;margin-bottom:1rem">DESGLOSE MRR POR MEMBRESÍA</div>
+        <div id="mrr-breakdown"></div>
+      </div>
+    </div>
+
     <div id="tab-briefing" class="tab-content">
       <div class="briefing-box" id="briefing-text"></div>
       <button class="copy-btn" onclick="copyBriefing()">COPIAR BRIEFING</button>
@@ -764,12 +831,13 @@ function pl(t,c){{return`<span class="pill ${{c}}">${{t}}</span>`;}}
 function fmtDate(iso){{if(!iso)return'—';return new Date(iso).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit'}});}}
 
 function showTab(t){{
-  ['hoy','semana','nuevos','members','intro','potenciales','briefing'].forEach((n,i)=>{{
+  ['hoy','semana','nuevos','members','intro','potenciales','economia','briefing'].forEach((n,i)=>{{
     document.querySelectorAll('.tab')[i]?.classList.toggle('active',n===t);
   }});
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
   document.getElementById('tab-'+t)?.classList.add('active');
   if(t==='briefing') renderBriefing();
+  if(t==='economia') renderEconomia();
 }}
 
 function showSubtab(name,btn){{
@@ -802,9 +870,8 @@ function taskHTML(t){{
       <div class="taction ${{m.acls}}">${{t.action}}</div>
       <div class="tmeta">${{pc}}${{nc}}${{coach}}</div>
       <div class="tnote-box">
-        ${{note}}
+        ${{renderNotes(t.formatted_notes||[])}}
         <div class="tnote-actions">
-          <input class="tnote-input" placeholder="Nota rápida..." oninput="">
           <a href="${{t.momence_notes_url}}" target="_blank" class="note-link">+ añadir nota en Momence →</a>
         </div>
       </div>
@@ -863,7 +930,7 @@ function renderActivos(){{
       <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
       <td style="max-width:150px">${{tags(m.tags)}}</td>
       <td style="font-size:11px">${{m.membership_summary||'—'}}</td>
-      <td style="font-size:11px;color:${{m.days_inactive>21?'#8e352d':m.days_inactive>14?'#854f0b':'#3b6d11'}}">${{ls}} <span style="font-size:10px;opacity:0.7">(${{m.days_inactive}}d)</span></td>
+      <td style="font-size:11px;color:${{m.days_inactive>21?'#222323':m.days_inactive>14?'#854f0b':'#3b6d11'}}">${{ls}} <span style="font-size:10px;opacity:0.7">(${{m.days_inactive}}d)</span></td>
       <td style="font-size:11px">${{m.next_class||'—'}}</td>
       <td style="font-size:11px;color:#847366">${{coaches}}</td>
       <td>${{noteCell(m)}}</td>
@@ -879,7 +946,7 @@ function renderRefrescar(){{
       <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
       <td style="font-size:11px">${{m.membership_summary||'—'}}</td>
       <td style="font-size:11px">${{ls}}</td>
-      <td style="font-weight:500;color:${{m.days_inactive>21?'#8e352d':'#854f0b'}}">${{m.days_inactive}}d</td>
+      <td style="font-weight:500;color:${{m.days_inactive>21?'#222323':'#854f0b'}}">${{m.days_inactive}}d</td>
       <td style="font-size:11px">${{m.next_class||'—'}}</td>
       <td>${{noteCell(m)}}</td>
     </tr>`;
@@ -904,7 +971,7 @@ function renderIntro(){{
       <td>${{pl(urgLabel,urgCls)}}</td>
       <td style="font-size:11px;color:#aaa">${{m.prev_class||'—'}}</td>
       <td style="font-size:11px">${{m.next_class||'—'}}</td>
-      <td style="text-align:center;color:${{m.intro_expiry_days!==null&&m.intro_expiry_days<=7?'#8e352d':'#847366'}};font-size:11px">${{expiry}}</td>
+      <td style="text-align:center;color:${{m.intro_expiry_days!==null&&m.intro_expiry_days<=7?'#222323':'#847366'}};font-size:11px">${{expiry}}</td>
       <td>${{noteCell(m)}}</td>
     </tr>`;
   }}).join(''):'<tr><td colspan="7" class="empty">Sin Intro Journeys activos</td></tr>';
@@ -948,6 +1015,30 @@ function renderBriefing(){{
 }}
 
 function copyBriefing(){{navigator.clipboard.writeText(document.getElementById('briefing-text').textContent).then(()=>toast('Briefing copiado'));}}
+
+function renderNotes(notes){{
+  if(!notes||!notes.length) return '';
+  const items=notes.map(n=>`<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:3px"><span style="font-size:10px;color:#aaa;flex-shrink:0">${{n.date||''}}</span><span style="font-size:11px;color:#847366;font-style:italic">"${{n.content.slice(0,100)}}${{n.content.length>100?'…':''}}"</span></div>`).join('');
+  return items;
+}}
+
+function renderEconomia(){{
+  const MRR_BREAKDOWN={mrr_breakdown_json};
+  const el=document.getElementById('mrr-breakdown');
+  if(!el)return;
+  const entries=Object.entries(MRR_BREAKDOWN).sort((a,b)=>b[1]-a[1]);
+  const total=entries.reduce((s,e)=>s+e[1],0)||1;
+  el.innerHTML=entries.map(([name,val])=>{{
+    const pct=Math.round((val/total)*100);
+    return`<div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+        <span style="font-size:12px;color:#222323">${{name}}</span>
+        <span style="font-size:12px;font-weight:500">${{val.toFixed(0)}}€ <span style="font-size:10px;color:#847366">${{pct}}%</span></span>
+      </div>
+      <div style="height:3px;background:#f0f0f0;border-radius:2px"><div style="height:100%;width:${{pct}}%;background:#27303d;border-radius:2px"></div></div>
+    </div>`;
+  }}).join('');
+}}
 
 function init(){{
   filterList('today','');filterList('week','');
@@ -1003,10 +1094,34 @@ def main():
     to_refresh = sum(1 for m in members_data if
         'Member' in m['tags'] and not m['is_platform'] and m['days_inactive'] > 14)
 
+    # MRR calculations
+    total_mrr = sum(m['mrr'] for m in members_data if m and 'Member' in m['tags'] and not m['is_platform'])
+    mrr_at_risk = sum(m['mrr'] for m in members_data if m and 'Member' in m['tags'] and not m['is_platform'] and not m['has_pm'] and m['has_subscription'])
+    mrr_failed = sum(m['mrr'] for m in members_data if m and 'Member' in m['tags'] and not m['is_platform'] and m['mrr'] > 0 and not m['has_pm'])
+    ltv_values = [m.get('ltv', 0) for m in members_data if m and 'Member' in m['tags'] and not m['is_platform']]
+    avg_ltv = sum(ltv_values) / len(ltv_values) if ltv_values else 0
+
+    # MRR by membership type
+    mrr_by_type = {}
+    for m in members_data:
+        if not m or 'Member' not in m['tags'] or m['is_platform']: continue
+        for mem in m.get('active_memberships', []) if 'active_memberships' in m else []:
+            pass
+    # Simpler: group by membership_summary prefix
+    mrr_breakdown = {}
+    for m in members_data:
+        if not m or 'Member' not in m['tags'] or m['is_platform'] or m['mrr'] <= 0: continue
+        mem_name = m['membership_summary'].split('·')[0].strip() if m['membership_summary'] else 'Otro'
+        mrr_breakdown[mem_name] = mrr_breakdown.get(mem_name, 0) + m['mrr']
+
     stats = {
         'active_members': active, 'intro_count': intro,
         'new_members': new_members, 'potenciales': potencial,
         'no_payment_method': no_pm, 'to_refresh': to_refresh,
+        'total_mrr': round(total_mrr, 2),
+        'mrr_at_risk': round(mrr_at_risk, 2),
+        'avg_ltv': round(avg_ltv, 2),
+        'mrr_breakdown': mrr_breakdown,
     }
 
     print('📋 Construyendo tareas...')
