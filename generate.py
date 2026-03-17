@@ -60,9 +60,25 @@ def api_delete(token, path):
 def days_since(iso_str):
     if not iso_str: return None
     try:
+        # Convert to Madrid time for accurate calculation
+        from datetime import timezone
+        import zoneinfo
+        try:
+            madrid = zoneinfo.ZoneInfo('Europe/Madrid')
+        except:
+            madrid = timezone(timedelta(hours=1))
         dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-        return max(0, (TODAY - dt).days)
+        today_madrid = TODAY.astimezone(madrid).date()
+        dt_madrid = dt.astimezone(madrid).date()
+        return max(0, (today_madrid - dt_madrid).days)
     except: return None
+
+def get_last_checkin_date(sessions_past):
+    for s in sessions_past:
+        checked_in = s['data'].get('checkedIn', False)
+        if checked_in:
+            return s['dt']
+    return None
 
 def fetch_all_members(token):
     members, page = [], 0
@@ -161,7 +177,29 @@ def process_member(token, member, tag_ids):
     has_active = len(own_active_mems) > 0
     has_subscription = any(is_subscription(m) for m in own_active_mems)
     has_future = len(future_sessions) > 0
-    days_inactive = days_since(member.get('lastSeen', '')) or 0
+
+    # Pack credits - for non-subscription memberships
+    pack_credits_left = None
+    pack_credits_total = None
+    pack_alert = False
+    for m in own_active_mems:
+        if not is_subscription(m) and not is_intro_journey(m) and not is_clase_prueba(m):
+            used = m.get('usedSessions') or 0
+            total = m.get('usageLimitForSessions')
+            if total:
+                left = max(0, total - used)
+                pack_credits_left = left
+                pack_credits_total = total
+                # Alert when <=20% remaining
+                threshold = max(1, round(total * 0.20))
+                pack_alert = left <= threshold
+                break
+    # Use last checked-in session for accurate inactivity, fallback to lastSeen
+    last_checkin = get_last_checkin_date(past_sessions)
+    if last_checkin:
+        days_inactive = days_since(last_checkin.isoformat()) or 0
+    else:
+        days_inactive = days_since(member.get('lastSeen', '')) or 0
 
     # Exact membership type detection
     has_intro_journey = any(is_intro_journey(m) for m in own_active_mems)
@@ -279,6 +317,9 @@ def process_member(token, member, tag_ids):
         'has_active': has_active,
         'has_subscription': has_subscription,
         'has_future': has_future,
+        'pack_credits_left': pack_credits_left,
+        'pack_credits_total': pack_credits_total,
+        'pack_alert': pack_alert,
         'is_platform': is_platform,
         'is_intro': has_intro_journey,
         'is_clase_prueba': has_clase_prueba,
@@ -355,6 +396,25 @@ def build_tasks(members_data):
                 if nc_days == 0: tasks_today.append(item)
                 else: tasks_week.append(item)
 
+        # Reminder metodo de pago el dia que vienen
+        if not m['has_pm'] and m['has_subscription'] and nc_days == 0:
+            key = f"{email}_pm_reminder_hoy"
+            if key not in seen:
+                seen.add(key)
+                tasks_today.append({
+                    'type': 'pm_reminder',
+                    'name': m['name'], 'email': email,
+                    'detail': f"Viene hoy · {m['next_class']} · sin método de pago guardado",
+                    'action': 'Pedir método de pago al llegar — tarjeta o cuenta bancaria',
+                    'nc': m['next_class'], 'nc_days': 0,
+                    'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
+                    'next_coach': m['next_coach'],
+                    'last_note': m['last_note'],
+                    'momence_url': m['momence_url'],
+                    'momence_notes_url': m['momence_notes_url'],
+                    'priority': 2, 'sd': 0
+                })
+
         # Reservas unpaid sin membresía activa (avisar 2 días antes)
         for unpaid in m['unpaid_future']:
             key = f"{email}_unpaid_{unpaid['date']}"
@@ -381,23 +441,25 @@ def build_tasks(members_data):
                         else: tasks_week.append(item)
                 except: pass
 
-        # Pack expirando (no suscripción, pago directo)
-        if not m['has_subscription'] and m['has_future'] and nc_days is not None and nc_days <= 14:
+        # Pack expirando - usar créditos restantes (<=20% del total)
+        if not m['has_subscription'] and m['pack_credits_left'] is not None and m['pack_alert']:
             key = f"{email}_pack_expirando"
             if key not in seen:
                 seen.add(key)
+                left = m['pack_credits_left']
+                total = m['pack_credits_total']
                 item = {
                     'type': 'pack_expirando',
                     'name': m['name'], 'email': email,
-                    'detail': f"Última clase en {'hoy' if nc_days == 0 else str(nc_days)+'d'} · {m['next_class']}",
-                    'action': 'Ofrecer renovación de pack — hablar en clase',
+                    'detail': f"Pack · {left} clase{'s' if left!=1 else ''} restante{'s' if left!=1 else ''} de {total} · {m['membership_summary'].split('·')[0].strip()}",
+                    'action': 'Ofrecer renovación de pack — hablar en la próxima clase',
                     'nc': m['next_class'], 'nc_days': nc_days,
                     'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
                     'next_coach': m['next_coach'],
                     'last_note': m['last_note'],
                     'momence_url': m['momence_url'],
                     'momence_notes_url': m['momence_notes_url'],
-                    'priority': 3, 'sd': nc_days or 0
+                    'priority': 3, 'sd': nc_days if nc_days is not None else 99
                 }
                 if nc_days == 0: tasks_today.append(item)
                 else: tasks_week.append(item)
@@ -598,6 +660,7 @@ tr:hover td{{background:#fafafa}}
         <button class="fb" onclick="filterList('today','pack_expirando',this)">Pack hoy</button>
         <button class="fb" onclick="filterList('today','intro_journey',this)">Intro</button>
         <button class="fb" onclick="filterList('today','reserva_unpaid',this)">Unpaid</button>
+        <button class="fb" onclick="filterList('today','pm_reminder',this)">💳 Pedir PM</button>
       </div>
       <div class="task-list" id="list-hoy"></div>
     </div>
@@ -722,6 +785,7 @@ const TM={{
   pack_expirando:{{label:'Pack acaba',pill:'tp3',cls:'info',acls:'b'}},
   intro_journey:{{label:'Intro Journey',pill:'tp4',cls:'info',acls:'b'}},
   reserva_unpaid:{{label:'Unpaid',pill:'tp1',cls:'urg',acls:'r'}},
+  pm_reminder:{{label:'💳 Pedir método pago',pill:'tp2',cls:'warn',acls:'a'}},
 }};
 
 function taskHTML(t){{
