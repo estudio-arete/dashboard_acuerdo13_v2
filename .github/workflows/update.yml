@@ -2,7 +2,7 @@ name: Actualizar dashboard aretē
 
 on:
   schedule:
-    - cron: '0 6,11,14,16,18,20 * * *'
+    - cron: '0 7-21 * * *'
   workflow_dispatch:
 
 jobs:
@@ -26,7 +26,6 @@ jobs:
           MOMENCE_EMAIL: ${{ secrets.MOMENCE_EMAIL }}
           MOMENCE_PASSWORD: ${{ secrets.MOMENCE_PASSWORD }}
           GH_REPO: ${{ github.repository }}
-          GH_PAT: ${{ secrets.GH_PAT }}
         run: python generate.py
 
       - name: Deploy
