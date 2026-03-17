@@ -1,0 +1,34 @@
+name: Actualizar dashboard aretē
+
+on:
+  schedule:
+    - cron: '0 7,13,19 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate dashboard
+        env:
+          MOMENCE_CLIENT_ID: ${{ secrets.MOMENCE_CLIENT_ID }}
+          MOMENCE_CLIENT_SECRET: ${{ secrets.MOMENCE_CLIENT_SECRET }}
+          MOMENCE_EMAIL: ${{ secrets.MOMENCE_EMAIL }}
+          MOMENCE_PASSWORD: ${{ secrets.MOMENCE_PASSWORD }}
+        run: python generate.py
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./output
