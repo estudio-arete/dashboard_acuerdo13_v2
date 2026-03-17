@@ -192,7 +192,7 @@ def process_member(token, member, tag_ids):
     intro_expiry_days = None
     if is_intro_mem:
         m = own_active_mems[0]
-        intro_classes_used = m.get('usedSessions', 0)
+        intro_classes_used = m.get('usedSessions') or 0
         intro_classes_total = m.get('usageLimitForSessions') or 3
         intro_classes_left = max(0, intro_classes_total - intro_classes_used)
         end_date = m.get('endDate', '')
