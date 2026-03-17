@@ -235,7 +235,7 @@ def process_member(token, member, tag_ids):
         m = next(x for x in own_active_mems if is_intro_journey(x))
         intro_classes_used = m.get('usedSessions') or 0
         intro_classes_total = m.get('usageLimitForSessions') or 3
-        intro_classes_left = max(0, intro_classes_total - intro_classes_used)
+        intro_classes_left = max(0, (intro_classes_total or 0) - (intro_classes_used or 0))
         end_date = m.get('endDate', '')
         if end_date:
             try:
