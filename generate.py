@@ -8,12 +8,26 @@ CLIENT_ID = os.environ['MOMENCE_CLIENT_ID']
 CLIENT_SECRET = os.environ['MOMENCE_CLIENT_SECRET']
 EMAIL = os.environ['MOMENCE_EMAIL']
 PASSWORD = os.environ['MOMENCE_PASSWORD']
+GH_REPO = os.environ.get('GH_REPO', 'estudio-arete/dashboard_acuerdo13_v2')
+GH_PAT = os.environ.get('GH_PAT', '')
 BASE = 'https://api.momence.com'
 HOST_ID = 45937
-MOMENCE_PROFILE_BASE = f'https://momence.com/dashboard/{HOST_ID}/customers'
+MOMENCE_PROFILE_BASE = f'https://momence.com/dashboard/{HOST_ID}/crm'
 TODAY = datetime.now(timezone.utc)
 TODAY_STR = TODAY.strftime('%d/%m/%Y %H:%M')
 TODAY_DATE = TODAY.date()
+
+PLATFORM_TAGS = {'classpass', 'WELLHUB', 'urbansportsclub'}
+PLATFORM_EMAILS = ['classpass.com', 'urbansportsclub.com', 'members.classpass.com', 'gympass.com', 'wellhub.com']
+
+def is_platform_user(member):
+    email = member.get('email', '').lower()
+    if any(p in email for p in ['classpass', 'urbansports', 'wellhub', 'gympass']):
+        return True
+    tag_names = {t['name'].lower() for t in member.get('customerTags', [])}
+    if tag_names & {'classpass', 'wellhub', 'urbansportsclub', 'gympass'}:
+        return True
+    return False
 
 def get_token():
     r = requests.post(f'{BASE}/api/v2/auth/token', data={
@@ -76,24 +90,27 @@ def fetch_active_memberships(token, mid):
     data = api_get(token, f'/api/v2/host/members/{mid}/bought-memberships/active', {'page': 0, 'pageSize': 10})
     return data.get('payload', [])
 
-def fetch_future_sessions(token, mid):
-    data = api_get(token, f'/api/v2/host/members/{mid}/sessions', {'page': 0, 'pageSize': 10})
+def fetch_all_sessions(token, mid):
+    data = api_get(token, f'/api/v2/host/members/{mid}/sessions', {'page': 0, 'pageSize': 20})
     sessions = data.get('payload', [])
-    future = []
+    past, future = [], []
     for s in sessions:
         starts = s.get('session', {}).get('startsAt', '')
         if starts:
             try:
                 dt = datetime.fromisoformat(starts.replace('Z', '+00:00'))
-                if dt > TODAY: future.append({'dt': dt, 'session': s})
+                if dt > TODAY:
+                    future.append({'dt': dt, 'data': s})
+                else:
+                    past.append({'dt': dt, 'data': s})
             except: pass
     future.sort(key=lambda x: x['dt'])
-    return future
+    past.sort(key=lambda x: x['dt'], reverse=True)
+    return past, future
 
-def fetch_last_note(token, mid):
-    data = api_get(token, f'/api/v2/host/members/{mid}/notes', {'page': 0, 'pageSize': 3})
-    notes = data.get('payload', [])
-    return notes[0].get('content', '') if notes else ''
+def fetch_notes(token, mid):
+    data = api_get(token, f'/api/v2/host/members/{mid}/notes', {'page': 0, 'pageSize': 5})
+    return data.get('payload', [])
 
 def assign_tag(token, mid, tag_id):
     return api_post(token, f'/api/v2/host/members/{mid}/tags', {'tagId': tag_id})
@@ -101,10 +118,17 @@ def assign_tag(token, mid, tag_id):
 def remove_tag(token, mid, tag_id):
     return api_delete(token, f'/api/v2/host/members/{mid}/tags/{tag_id}')
 
+def format_session(s_obj):
+    if not s_obj: return None
+    dt = s_obj['dt']
+    name = s_obj['data'].get('session', {}).get('name', '')
+    return dt.strftime('%d/%m %H:%M') + ' · ' + name.split('·')[0].strip()
+
 def process_member(token, member, tag_ids):
     mid = member['id']
     tag_names = [t['name'] for t in member.get('customerTags', [])]
     tag_id_map = {t['name']: t['id'] for t in member.get('customerTags', [])}
+    is_platform = is_platform_user(member)
 
     RELEVANT = {'Member','FORMER MEMBER','member potencial','introjourney','DUCK','INFLU','MANUAL','CASH','PAGO FALLIDO','NO CANCELAR!'}
     visits = member.get('visits', {}).get('totalVisits', 0)
@@ -112,29 +136,36 @@ def process_member(token, member, tag_ids):
         return None
 
     active_mems = fetch_active_memberships(token, mid)
-    future_sessions = fetch_future_sessions(token, mid)
-    last_note = fetch_last_note(token, mid)
+    past_sessions, future_sessions = fetch_all_sessions(token, mid)
+    notes = fetch_notes(token, mid)
 
-    # Auto tag logic
-    is_manual_cash = 'MANUAL' in tag_names or 'CASH' in tag_names
-    has_active = len(active_mems) > 0
+    # Filter platform memberships
+    own_active_mems = [m for m in active_mems if not any(
+        p in m.get('membership', {}).get('name', '').lower()
+        for p in ['classpass', 'wellhub', 'gympass', 'urban']
+    )]
+
+    has_active = len(own_active_mems) > 0
     has_future = len(future_sessions) > 0
     days_inactive = days_since(member.get('lastSeen', '')) or 0
-    is_intro_mem = any('intro' in m.get('membership', {}).get('name', '').lower() or
-                       'prueba' in m.get('membership', {}).get('name', '').lower()
-                       for m in active_mems)
 
+    is_intro_mem = any(
+        'intro' in m.get('membership', {}).get('name', '').lower() or
+        'prueba' in m.get('membership', {}).get('name', '').lower()
+        for m in own_active_mems
+    )
+
+    # Auto tag logic (skip platform-only users for member tagging)
     add_tags, remove_tags = [], []
-
-    if (has_active and not is_intro_mem) or (has_future and not has_active) or (not has_active and not has_future and days_inactive <= 30):
-        if 'Member' not in tag_names: add_tags.append('Member')
-        if 'FORMER MEMBER' in tag_names: remove_tags.append('FORMER MEMBER')
-        if 'member potencial' in tag_names and not is_intro_mem: remove_tags.append('member potencial')
-    elif is_intro_mem or (not has_active and not has_future and days_inactive <= 30):
-        if 'member potencial' not in tag_names: add_tags.append('member potencial')
-    elif not has_active and not has_future and days_inactive > 30 and 'DUCK' not in tag_names and 'INFLU' not in tag_names:
-        if 'FORMER MEMBER' not in tag_names: add_tags.append('FORMER MEMBER')
-        if 'Member' in tag_names: remove_tags.append('Member')
+    if not is_platform:
+        if (has_active and not is_intro_mem) or (has_future and not has_active) or (not has_active and not has_future and days_inactive <= 30):
+            if 'Member' not in tag_names: add_tags.append('Member')
+            if 'FORMER MEMBER' in tag_names: remove_tags.append('FORMER MEMBER')
+        elif is_intro_mem:
+            if 'member potencial' not in tag_names: add_tags.append('member potencial')
+        elif not has_active and not has_future and days_inactive > 30 and 'DUCK' not in tag_names and 'INFLU' not in tag_names:
+            if 'FORMER MEMBER' not in tag_names: add_tags.append('FORMER MEMBER')
+            if 'Member' in tag_names: remove_tags.append('Member')
 
     for tag_name in add_tags:
         tid = tag_ids.get(tag_name)
@@ -147,19 +178,34 @@ def process_member(token, member, tag_ids):
             if remove_tag(token, mid, tid):
                 if tag_name in tag_names: tag_names.remove(tag_name)
 
-    # Next class
-    next_class, next_class_days = None, None
-    if future_sessions:
-        nc = future_sessions[0]
-        dt = nc['dt']
-        name = nc['session'].get('session', {}).get('name', '')
-        next_class = dt.strftime('%d/%m %H:%M') + ' · ' + name.split('·')[0].strip()
-        next_class_days = (dt.date() - TODAY_DATE).days
+    # Session info
+    next_session = future_sessions[0] if future_sessions else None
+    prev_session = past_sessions[0] if past_sessions else None
+    next_class = format_session(next_session)
+    prev_class = format_session(prev_session)
+    next_class_days = (next_session['dt'].date() - TODAY_DATE).days if next_session else None
+
+    # Intro journey classes info
+    intro_classes_used = 0
+    intro_classes_total = 0
+    intro_classes_left = 0
+    intro_expiry_days = None
+    if is_intro_mem:
+        m = own_active_mems[0]
+        intro_classes_used = m.get('usedSessions', 0)
+        intro_classes_total = m.get('usageLimitForSessions') or 3
+        intro_classes_left = max(0, intro_classes_total - intro_classes_used)
+        end_date = m.get('endDate', '')
+        if end_date:
+            try:
+                dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                intro_expiry_days = (dt.date() - TODAY_DATE).days
+            except: pass
 
     # Membership summary
     membership_summary, renewal_days = '', None
-    if active_mems:
-        m = active_mems[0]
+    if own_active_mems:
+        m = own_active_mems[0]
         mem_name = m.get('membership', {}).get('name', '')
         used = m.get('usedSessions', 0)
         total_limit = m.get('usageLimitForSessions')
@@ -176,6 +222,12 @@ def process_member(token, member, tag_ids):
             except: pass
         membership_summary = ' · '.join(parts)
 
+    # Notes
+    last_note = notes[0].get('content', '') if notes else ''
+    all_notes = [{'content': n.get('content',''), 'date': n.get('createdAt','')} for n in notes[:3]]
+
+    has_pm = 'PM' in tag_names or 'MANUAL' in tag_names or 'CASH' in tag_names
+
     return {
         'id': mid,
         'name': f"{member.get('firstName','')} {member.get('lastName','')}".strip(),
@@ -187,14 +239,23 @@ def process_member(token, member, tag_ids):
         'days_inactive': days_inactive,
         'has_active': has_active,
         'has_future': has_future,
+        'is_platform': is_platform,
+        'is_intro': is_intro_mem,
+        'is_manual_cash': 'MANUAL' in tag_names or 'CASH' in tag_names,
+        'has_pm': has_pm,
         'membership_summary': membership_summary,
         'renewal_days': renewal_days,
         'next_class': next_class,
         'next_class_days': next_class_days,
+        'prev_class': prev_class,
+        'intro_classes_used': intro_classes_used,
+        'intro_classes_total': intro_classes_total,
+        'intro_classes_left': intro_classes_left,
+        'intro_expiry_days': intro_expiry_days,
         'last_note': last_note,
+        'all_notes': all_notes,
         'momence_url': f'{MOMENCE_PROFILE_BASE}/{mid}',
         'added_tags': add_tags,
-        'is_manual_cash': is_manual_cash,
     }
 
 def build_tasks(members_data):
@@ -202,59 +263,88 @@ def build_tasks(members_data):
     seen = set()
 
     for m in members_data:
-        if not m: continue
+        if not m or m['is_platform']: continue
         tags = m['tags']
         nc_days = m['next_class_days']
         email = m['email']
 
-        # Sin PM + renovación próxima
-        has_pm = 'PM' in tags or m['is_manual_cash']
-        if not has_pm and m['has_active'] and m['renewal_days'] is not None and m['renewal_days'] <= 7:
+        # Sin PM + renovación próxima (solo propios, no plataforma)
+        if not m['has_pm'] and m['has_active'] and m['renewal_days'] is not None and m['renewal_days'] <= 7:
             key = f"{email}_sin_metodo_pago"
             if key not in seen:
                 seen.add(key)
-                item = {'type':'sin_metodo_pago','name':m['name'],'email':email,
-                        'detail':m['membership_summary'],'action':'Conseguir método de pago antes de la renovación',
-                        'nc':m['next_class'],'nc_days':nc_days,'momence_url':m['momence_url'],'priority':2,'sd':nc_days if nc_days is not None else 99}
+                item = {
+                    'type': 'sin_metodo_pago',
+                    'name': m['name'], 'email': email,
+                    'detail': m['membership_summary'],
+                    'action': 'Conseguir método de pago antes de la renovación',
+                    'nc': m['next_class'], 'nc_days': nc_days,
+                    'momence_url': m['momence_url'],
+                    'priority': 2, 'sd': nc_days if nc_days is not None else 99
+                }
                 if nc_days == 0: tasks_today.append(item)
                 else: tasks_week.append(item)
 
-        # Pack expirando
+        # Pack expirando (solo pago directo, no plataforma)
         if not m['has_active'] and m['has_future'] and nc_days is not None and nc_days <= 14:
             key = f"{email}_pack_expirando"
             if key not in seen:
                 seen.add(key)
-                item = {'type':'pack_expirando','name':m['name'],'email':email,
-                        'detail':f"Última clase en {nc_days if nc_days > 0 else 'hoy'}d · {m['next_class']}",
-                        'action':'Ofrecer renovación de pack — hablar en clase',
-                        'nc':m['next_class'],'nc_days':nc_days,'momence_url':m['momence_url'],'priority':3,'sd':nc_days or 0}
+                item = {
+                    'type': 'pack_expirando',
+                    'name': m['name'], 'email': email,
+                    'detail': f"Última clase en {'hoy' if nc_days == 0 else str(nc_days)+'d'} · {m['next_class']}",
+                    'action': 'Ofrecer renovación de pack — hablar en clase',
+                    'nc': m['next_class'], 'nc_days': nc_days,
+                    'momence_url': m['momence_url'],
+                    'priority': 3, 'sd': nc_days or 0
+                }
                 if nc_days == 0: tasks_today.append(item)
                 else: tasks_week.append(item)
 
-        # Intro journey
-        if 'member potencial' in tags or 'introjourney' in tags:
-            v = m['visits']
-            if v >= 1:
-                key = f"{email}_intro_journey"
-                if key not in seen:
-                    seen.add(key)
-                    is_conv = v >= 2
-                    item = {'type':'intro_journey','name':m['name'],'email':email,
-                            'detail':f"Intro Journey · {v} visita{'s' if v!=1 else ''} · {m['membership_summary']}",
-                            'action':'Convertir a member — hablar después de la clase' if is_conv else 'Seguimiento — preguntar cómo va',
-                            'nc':m['next_class'],'nc_days':nc_days,'momence_url':m['momence_url'],
-                            'priority':2 if is_conv else 4,'sd':nc_days if nc_days is not None else 99}
-                    if nc_days == 0: tasks_today.append(item)
-                    else: tasks_week.append(item)
+        # Intro journey — ordenado por urgencia
+        if m['is_intro'] and m['visits'] >= 1:
+            key = f"{email}_intro_journey"
+            if key not in seen:
+                seen.add(key)
+                left = m['intro_classes_left']
+                used = m['intro_classes_used']
+                if left == 0:
+                    urgency = 1
+                    action = 'URGENTE — No le quedan clases. Contactar hoy para convertir'
+                elif left == 1:
+                    urgency = 2
+                    action = 'Le queda 1 clase — hablar en la próxima para convertir'
+                elif used >= 2:
+                    urgency = 3
+                    action = 'Convertir a member — hablar después de la clase'
+                else:
+                    urgency = 4
+                    action = 'Seguimiento — preguntar cómo va el intro'
+
+                item = {
+                    'type': 'intro_journey',
+                    'name': m['name'], 'email': email,
+                    'detail': f"Intro · {used}/{m['intro_classes_total']} clases · {left} restantes · caduca en {m['intro_expiry_days']}d",
+                    'action': action,
+                    'nc': m['next_class'], 'nc_days': nc_days,
+                    'prev_class': m['prev_class'],
+                    'momence_url': m['momence_url'],
+                    'priority': urgency, 'sd': nc_days if nc_days is not None else 99
+                }
+                if nc_days == 0: tasks_today.append(item)
+                else: tasks_week.append(item)
 
     tasks_today.sort(key=lambda x: x['priority'])
-    tasks_week.sort(key=lambda x: (x.get('sd',99), x['priority']))
+    tasks_week.sort(key=lambda x: (x.get('sd', 99), x['priority']))
     return tasks_today, tasks_week
 
 def generate_html(members_data, tasks_today, tasks_week, stats):
     mj = json.dumps([m for m in members_data if m], ensure_ascii=False)
     tj = json.dumps(tasks_today, ensure_ascii=False)
     wj = json.dumps(tasks_week, ensure_ascii=False)
+    gh_repo = GH_REPO
+    gh_pat = GH_PAT
 
     return f'''<!DOCTYPE html>
 <html lang="es">
@@ -264,16 +354,20 @@ def generate_html(members_data, tasks_today, tasks_week, stats):
 <title>aretē · gestión</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;color:#222323;background:#f5f5f5;min-height:100vh}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;color:#222323;background:#f5f5f5}}
 .app{{padding:1rem;max-width:1100px;margin:0 auto}}
 .topbar{{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;padding:0.75rem 1rem;border-radius:8px;background:#222323;color:#fff;flex-wrap:wrap;gap:8px}}
 .brand{{font-size:16px;font-weight:500;letter-spacing:0.04em}}
 .brand em{{font-weight:400;color:#847366;font-size:12px;margin-left:8px;font-style:normal}}
 .update-info{{font-size:10px;color:#847366}}
-.topbar-actions{{display:flex;gap:6px}}
-.btn{{font-size:11px;padding:5px 10px;border:1px solid rgba(255,255,255,0.2);border-radius:6px;background:transparent;color:#fff;cursor:pointer}}
+.topbar-actions{{display:flex;gap:6px;align-items:center}}
+.btn{{font-size:11px;padding:5px 10px;border:1px solid rgba(255,255,255,0.2);border-radius:6px;background:transparent;color:#fff;cursor:pointer;white-space:nowrap}}
 .btn:hover{{background:rgba(255,255,255,0.1)}}
-.btn.primary{{background:#8e352d;border-color:#8e352d}}
+.btn.rust{{background:#8e352d;border-color:#8e352d}}
+.btn.rust:hover{{background:#a03e35}}
+.btn-refresh{{font-size:11px;padding:5px 12px;border:1px solid #8e352d;border-radius:6px;background:#8e352d;color:#fff;cursor:pointer;display:flex;align-items:center;gap:5px}}
+.btn-refresh:hover{{background:#a03e35}}
+.btn-refresh.loading{{opacity:0.7;cursor:not-allowed}}
 .metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:1rem}}
 .metric{{background:#fff;border-radius:8px;padding:0.65rem;text-align:center;border:1px solid #eee}}
 .metric .n{{font-size:22px;font-weight:500;line-height:1.2}}
@@ -281,7 +375,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-si
 .red .n{{color:#a32d2d}}.amber .n{{color:#854f0b}}.green .n{{color:#3b6d11}}.blue .n{{color:#185fa5}}
 .prog-wrap{{background:#fff;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1rem;border:1px solid #eee}}
 .prog-bar{{height:5px;background:#f0f0f0;border-radius:3px;overflow:hidden;margin-top:6px}}
-.prog-fill{{height:100%;background:#639922;border-radius:3px;transition:width 0.5s}}
+.prog-fill{{height:100%;background:#639922;border-radius:3px}}
 .prog-labels{{display:flex;justify-content:space-between;font-size:10px;color:#847366;margin-top:3px}}
 .tabs-wrap{{background:#fff;border-radius:8px;border:1px solid #eee;overflow:hidden}}
 .tabs{{display:flex;border-bottom:1px solid #eee;overflow-x:auto}}
@@ -320,8 +414,6 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-si
 .taction.r{{color:#a32d2d}}.taction.a{{color:#854f0b}}.taction.b{{color:#185fa5}}
 .tmeta{{display:flex;align-items:center;gap:8px;margin-top:5px;flex-wrap:wrap}}
 .tclass{{font-size:10px;color:#847366;padding:2px 7px;border:1px solid #eee;border-radius:100px;background:#f9f9f9}}
-.tnote input{{font-size:11px;padding:3px 7px;border:1px solid #eee;border-radius:6px;background:#fff;color:#222323;width:180px}}
-.tnote input:focus{{outline:none;border-color:#aaa}}
 .toolbar{{display:flex;align-items:center;gap:6px;margin-bottom:0.75rem;flex-wrap:wrap}}
 .search{{font-size:12px;padding:5px 9px;border:1px solid #ddd;border-radius:6px;background:#fff;color:#222323;width:200px}}
 .search:focus{{outline:none;border-color:#aaa}}
@@ -336,17 +428,15 @@ tr:hover td{{background:#fafafa}}
 .p-danger{{background:#fcebeb;color:#a32d2d}}.p-info{{background:#e6f1fb;color:#185fa5}}
 .p-grey{{background:#f5f5f5;color:#847366}}.p-dark{{background:#222323;color:#fff}}
 .p-purple{{background:#eeedfe;color:#3c3489}}
-td input[type=text]{{font-size:11px;padding:2px 6px;border:1px solid transparent;border-radius:4px;background:transparent;color:#222323;width:100%;min-width:110px}}
-td input[type=text]:hover{{border-color:#eee}}
-td input[type=text]:focus{{outline:none;border-color:#ccc;background:#fff}}
-td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e352d}}
 .member-link{{color:#222323;text-decoration:none;font-weight:500}}
 .member-link:hover{{color:#8e352d;text-decoration:underline}}
-.briefing-box{{background:#f9f9f9;border-radius:8px;padding:1rem;font-size:12px;line-height:1.9;white-space:pre-wrap;border:1px solid #eee;min-height:220px;margin-bottom:0.75rem;font-family:'Courier New',monospace;color:#222323}}
-.save-bar{{display:flex;gap:8px;padding:0.75rem 1rem;border-top:1px solid #eee;background:#fafafa}}
-.save-bar .btn{{background:#fff;color:#222323;border:1px solid #ddd}}
-.save-bar .btn.primary{{background:#222323;color:#fff;border-color:#222323}}
-.toast{{position:fixed;bottom:1.5rem;right:1.5rem;background:#222323;color:#fff;padding:10px 18px;border-radius:8px;font-size:12px;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,0.15)}}
+.note-link{{font-size:10px;color:#8e352d;text-decoration:none;margin-left:4px}}
+.note-link:hover{{text-decoration:underline}}
+.briefing-box{{background:#f9f9f9;border-radius:8px;padding:1rem;font-size:12px;line-height:1.9;white-space:pre-wrap;border:1px solid #eee;min-height:220px;margin-bottom:0.75rem;font-family:'Courier New',monospace}}
+.subtabs{{display:flex;gap:4px;margin-bottom:0.75rem}}
+.stab{{font-size:11px;padding:4px 12px;border:1px solid #eee;border-radius:6px;cursor:pointer;background:#fff;color:#847366}}
+.stab.active{{background:#222323;color:#fff;border-color:#222323}}
+.toast{{position:fixed;bottom:1.5rem;right:1.5rem;background:#222323;color:#fff;padding:10px 18px;border-radius:8px;font-size:12px;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,0.2)}}
 .toast.show{{opacity:1}}
 .empty{{padding:2.5rem;text-align:center;color:#847366;font-size:12px}}
 @media(max-width:650px){{.metrics{{grid-template-columns:repeat(3,1fr)}}}}
@@ -357,12 +447,12 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
   <div class="topbar">
     <div>
       <div class="brand">aretē <em>· sistema de gestión</em></div>
-      <div class="update-info">Última actualización: {TODAY_STR} UTC · Se actualiza automáticamente 6 veces al día</div>
+      <div class="update-info" id="update-label">Última actualización: {TODAY_STR} UTC</div>
     </div>
     <div class="topbar-actions">
-      <button class="btn" onclick="document.getElementById('notes-in').click()">📂 Cargar notas</button>
-      <input type="file" id="notes-in" accept=".json" style="display:none" onchange="importNotes(event)">
-      <button class="btn primary" onclick="saveNotes()">💾 Guardar notas</button>
+      <button class="btn-refresh" id="refresh-btn" onclick="triggerRefresh()">
+        <span id="refresh-icon">↻</span> Actualizar ahora
+      </button>
     </div>
   </div>
 
@@ -410,7 +500,7 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
 
     <div id="tab-semana" class="tab-content">
       <div class="section-hdr">
-        <div class="section-title">Esta semana — ordenado por fecha de próxima clase</div>
+        <div class="section-title">Esta semana — en orden de urgencia y próxima clase</div>
         <div class="section-count" id="semana-count"></div>
       </div>
       <div class="filter-bar">
@@ -423,24 +513,32 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
     </div>
 
     <div id="tab-members" class="tab-content">
-      <div class="toolbar">
-        <input class="search" placeholder="Buscar nombre, email..." oninput="filterTbl('tbl-members',this.value)">
-        <select style="font-size:12px;padding:5px 8px;border:1px solid #ddd;border-radius:6px;background:#fff" onchange="filterByTag(this.value)">
-          <option value="">Todos</option>
-          <option value="Member">Member</option>
-          <option value="FORMER MEMBER">Former Member</option>
-          <option value="member potencial">Potencial</option>
-          <option value="introjourney">Intro Journey</option>
-          <option value="DUCK">DUCK</option>
-          <option value="MANUAL">Manual</option>
-          <option value="CASH">Cash</option>
-        </select>
+      <div class="subtabs">
+        <button class="stab active" onclick="showSubtab('activos',this)">Activos ({stats['active_members']})</button>
+        <button class="stab" onclick="showSubtab('refrescar',this)">A refrescar ({stats['to_refresh']})</button>
       </div>
-      <div class="tbl-wrap">
-        <table id="tbl-members">
-          <thead><tr><th>Nombre</th><th>Tags</th><th>Membresía</th><th>Última visita</th><th>Próxima clase</th><th>Visitas</th><th>Última nota Momence</th><th>Contactado</th><th>Nota equipo</th></tr></thead>
-          <tbody id="body-members"></tbody>
-        </table>
+      <div id="subtab-activos">
+        <div class="toolbar">
+          <input class="search" placeholder="Buscar nombre, email..." oninput="filterTbl('tbl-activos',this.value)">
+        </div>
+        <div class="tbl-wrap">
+          <table id="tbl-activos">
+            <thead><tr><th>Nombre</th><th>Tags</th><th>Membresía</th><th>Última visita</th><th>Próxima clase</th><th>Visitas</th><th>Última nota</th></tr></thead>
+            <tbody id="body-activos"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="subtab-refrescar" style="display:none">
+        <div class="toolbar">
+          <input class="search" placeholder="Buscar..." oninput="filterTbl('tbl-refrescar',this.value)">
+          <span style="font-size:11px;color:#847366">Members activos que llevan más de 14 días sin venir</span>
+        </div>
+        <div class="tbl-wrap">
+          <table id="tbl-refrescar">
+            <thead><tr><th>Nombre</th><th>Tags</th><th>Membresía</th><th>Última visita</th><th>Días inactivo</th><th>Próxima clase</th><th>Notas Momence</th></tr></thead>
+            <tbody id="body-refrescar"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -448,7 +546,7 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
       <div class="toolbar"><input class="search" placeholder="Buscar..." oninput="filterTbl('tbl-intro',this.value)"></div>
       <div class="tbl-wrap">
         <table id="tbl-intro">
-          <thead><tr><th>Nombre</th><th>Email</th><th>Visitas</th><th>Estado</th><th>Próxima clase</th><th>Membresía</th><th>Contactado</th><th>Notas</th></tr></thead>
+          <thead><tr><th>Nombre</th><th>Clases</th><th>Urgencia</th><th>Clase anterior</th><th>Próxima clase</th><th>Caduca en</th><th>Notas Momence</th></tr></thead>
           <tbody id="body-intro"></tbody>
         </table>
       </div>
@@ -457,11 +555,11 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
     <div id="tab-potenciales" class="tab-content">
       <div class="toolbar">
         <input class="search" placeholder="Buscar..." oninput="filterTbl('tbl-pot',this.value)">
-        <span style="font-size:11px;color:#847366">Vinieron pero no han convertido en más de 30 días</span>
+        <span style="font-size:11px;color:#847366">Excluyendo ClassPass, Wellhub y plataformas</span>
       </div>
       <div class="tbl-wrap">
         <table id="tbl-pot">
-          <thead><tr><th>Nombre</th><th>Email</th><th>Teléfono</th><th>Última visita</th><th>Visitas</th><th>Días inactivo</th><th>Contactado</th><th>Notas</th></tr></thead>
+          <thead><tr><th>Nombre</th><th>Email</th><th>Teléfono</th><th>Última visita</th><th>Visitas</th><th>Días inactivo</th><th>Notas Momence</th></tr></thead>
           <tbody id="body-pot"></tbody>
         </table>
       </div>
@@ -469,80 +567,94 @@ td input[type=checkbox]{{width:13px;height:13px;cursor:pointer;accent-color:#8e3
 
     <div id="tab-briefing" class="tab-content">
       <div class="briefing-box" id="briefing-text"></div>
-      <button class="btn primary" style="width:100%;margin-top:0" onclick="copyBriefing()">Copiar briefing</button>
+      <button onclick="copyBriefing()" style="width:100%;padding:8px;border:none;border-radius:6px;background:#222323;color:#fff;font-size:12px;cursor:pointer;margin-top:0">Copiar briefing</button>
     </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
 
 <script>
-const NOTES={{}};
 const MEMBERS={mj};
 const TASKS_TODAY={tj};
 const TASKS_WEEK={wj};
+const GH_REPO='{gh_repo}';
+const GH_PAT='{gh_pat}';
 let fT='',fW='';
 
-function n(k){{return NOTES[k]||{{}};}}
-function setN(k,f,v){{if(!NOTES[k])NOTES[k]={{}};NOTES[k][f]=v;}}
-function esc(s){{return String(s||'').replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'").replace(/"/g,'&quot;');}}
-function nf(k,f,ph){{const v=(n(k)[f]||'').replace(/"/g,'&quot;');return`<input type="text" placeholder="${{ph||'Nota...'}}" value="${{v}}" onchange="setN('${{esc(k)}}','${{f}}',this.value)">`;}}
-function ck(k,f){{return`<input type="checkbox" ${{n(k)[f]?'checked':''}} onchange="setN('${{esc(k)}}','${{f}}',this.checked)">`;}}
-function pl(t,c){{return`<span class="pill ${{c}}">${{t}}</span>`;}}
+function toast(m,dur=2500){{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),dur);}}
 function filterTbl(id,q){{document.querySelectorAll(`#${{id}} tbody tr`).forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q.toLowerCase())?'':'none');}}
-function toast(m){{const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500);}}
+function pl(t,c){{return`<span class="pill ${{c}}">${{t}}</span>`;}}
 
 function showTab(t){{
   ['hoy','semana','members','intro','potenciales','briefing'].forEach((n,i)=>{{
     document.querySelectorAll('.tab')[i]?.classList.toggle('active',n===t);
   }});
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
-  const el=document.getElementById('tab-'+t);
-  if(el)el.classList.add('active');
-  if(t==='briefing')renderBriefing();
+  document.getElementById('tab-'+t)?.classList.add('active');
+  if(t==='briefing') renderBriefing();
+}}
+
+function showSubtab(name, btn){{
+  document.getElementById('subtab-activos').style.display = name==='activos'?'block':'none';
+  document.getElementById('subtab-refrescar').style.display = name==='refrescar'?'block':'none';
+  document.querySelectorAll('.stab').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+}}
+
+async function triggerRefresh(){{
+  const btn = document.getElementById('refresh-btn');
+  const icon = document.getElementById('refresh-icon');
+  btn.classList.add('loading');
+  btn.disabled = true;
+  icon.textContent = '⏳';
+  toast('Actualizando datos desde Momence... puede tardar 5-10 minutos', 5000);
+  try{{
+    const r = await fetch(`https://api.github.com/repos/${{GH_REPO}}/actions/workflows/update.yml/dispatches`, {{
+      method: 'POST',
+      headers: {{'Authorization': `token ${{GH_PAT}}`,'Content-Type':'application/json','Accept':'application/vnd.github.v3+json'}},
+      body: JSON.stringify({{'ref':'main'}})
+    }});
+    if(r.status === 204){{
+      toast('✅ Actualización iniciada. El dashboard se recargará automáticamente en unos minutos.', 6000);
+      setTimeout(()=>location.reload(), 600000);
+    }} else {{
+      toast('Error al iniciar la actualización. Inténtalo de nuevo.');
+    }}
+  }} catch(e){{
+    toast('Error de conexión. Inténtalo de nuevo.');
+  }}
+  setTimeout(()=>{{btn.classList.remove('loading');btn.disabled=false;icon.textContent='↻';}}, 10000);
 }}
 
 const TM={{
   sin_metodo_pago:{{label:'⚠️ Sin método',pill:'tp2',cls:'warn',acls:'a'}},
   pack_expirando:{{label:'📦 Pack acaba',pill:'tp3',cls:'info',acls:'b'}},
   intro_journey:{{label:'🎯 Intro Journey',pill:'tp4',cls:'info',acls:'b'}},
-  pago_critico:{{label:'💳 Pago crítico',pill:'tp1',cls:'urg',acls:'r'}},
 }};
 
 function taskHTML(t){{
-  const key=t.email+'_'+t.type;
-  const done=n(key).done||false;
-  const note=(n(key).note||'').replace(/"/g,'&quot;');
   const m=TM[t.type]||{{label:'',pill:'tp5',cls:'',acls:''}};
   const nc=t.nc?`<span class="tclass">📅 ${{t.nc}}</span>`:'';
-  const sk=esc(key);
+  const pc=t.prev_class?`<span class="tclass" style="color:#aaa">⬅️ ${{t.prev_class}}</span>`:'';
   const nameEl=t.momence_url?`<a href="${{t.momence_url}}" target="_blank">${{t.name}}</a>`:t.name;
-  return`<div class="task ${{m.cls}} ${{done?'done':''}}" id="tk_${{key.replace(/[^a-z0-9]/gi,'_')}}">
-    <div class="task-chk"><input type="checkbox" ${{done?'checked':''}} onchange="toggleDone('${{sk}}',this.checked)"></div>
+  const urgClass = t.priority===1?'urg':t.priority<=2?'warn':'info';
+  return`<div class="task ${{urgClass}}">
     <div class="task-body">
       <div class="task-top"><span class="tname">${{nameEl}}</span><span class="tpill ${{m.pill}}">${{m.label}}</span></div>
       <div class="tdetail">${{t.detail}}</div>
       <div class="taction ${{m.acls}}">${{t.action}}</div>
-      <div class="tmeta">${{nc}}<div class="tnote"><input type="text" placeholder="Nota rápida..." value="${{note}}" onchange="setN('${{sk}}','note',this.value)"></div></div>
+      <div class="tmeta">${{pc}}${{nc}}</div>
     </div>
   </div>`;
 }}
 
-function toggleDone(key,checked){{
-  setN(key,'done',checked);
-  const el=document.getElementById('tk_'+key.replace(/[^a-z0-9]/gi,'_'));
-  if(el)el.classList.toggle('done',checked);
-  updateCounts();
-}}
-
 function updateCounts(){{
-  const td=TASKS_TODAY.filter(t=>n(t.email+'_'+t.type).done).length;
-  const tw=TASKS_WEEK.filter(t=>n(t.email+'_'+t.type).done).length;
-  document.getElementById('hoy-count').textContent=`${{td}} / ${{TASKS_TODAY.length}} completadas`;
-  document.getElementById('semana-count').textContent=`${{tw}} / ${{TASKS_WEEK.length}} completadas`;
-  document.getElementById('m-hoy').textContent=TASKS_TODAY.length-td||'0';
-  document.getElementById('m-semana').textContent=TASKS_WEEK.length-tw||'0';
-  document.getElementById('b-hoy').textContent=TASKS_TODAY.length-td;
-  document.getElementById('b-semana').textContent=TASKS_WEEK.length-tw;
+  document.getElementById('m-hoy').textContent=TASKS_TODAY.length||'0';
+  document.getElementById('m-semana').textContent=TASKS_WEEK.length||'0';
+  document.getElementById('b-hoy').textContent=TASKS_TODAY.length;
+  document.getElementById('b-semana').textContent=TASKS_WEEK.length;
+  document.getElementById('hoy-count').textContent=`${{TASKS_TODAY.length}} tareas`;
+  document.getElementById('semana-count').textContent=`${{TASKS_WEEK.length}} tareas`;
 }}
 
 function filterList(which,type,btn){{
@@ -555,58 +667,86 @@ function filterList(which,type,btn){{
 }}
 
 const TAG_COLORS={{'Member':'p-dark','FORMER MEMBER':'p-grey','member potencial':'p-ok','introjourney':'p-info','DUCK':'p-warn','PAGO FALLIDO':'p-danger','PM':'p-ok','MANUAL':'p-warn','CASH':'p-warn','ENG':'p-info','INFLU':'p-grey','NO CANCELAR!':'p-danger'}};
-const SHOW_TAGS=['Member','FORMER MEMBER','member potencial','introjourney','DUCK','INFLU','MANUAL','CASH','PM','PAGO FALLIDO','NO CANCELAR!','ENG'];
+const SHOW_TAGS=['Member','FORMER MEMBER','member potencial','introjourney','DUCK','INFLU','MANUAL','CASH','PM','ENG','NO CANCELAR!'];
 
-function renderMembers(){{
-  const ms=MEMBERS.filter(m=>m.tags.some(t=>['Member','FORMER MEMBER','member potencial','introjourney','DUCK','INFLU','MANUAL','CASH'].includes(t)));
-  document.getElementById('body-members').innerHTML=ms.length?ms.map(m=>{{
-    const tags=m.tags.filter(t=>SHOW_TAGS.includes(t)).map(t=>`<span class="pill ${{TAG_COLORS[t]||'p-grey'}}">${{t}}</span>`).join('');
-    const ls=m.last_seen?new Date(m.last_seen).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit'}}):'—';
-    const dc=m.days_inactive;
-    const dcColor=dc>21?'#a32d2d':dc>14?'#854f0b':'#3b6d11';
-    const noteVal=(n(m.email).note||'').replace(/"/g,'&quot;');
-    return`<tr>
-      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
-      <td style="max-width:160px">${{tags}}</td>
-      <td style="font-size:11px;max-width:180px">${{m.membership_summary||'—'}}</td>
-      <td style="font-size:11px;color:${{dcColor}}">${{ls}}<div style="font-size:10px">${{dc}}d inactivo</div></td>
-      <td style="font-size:11px">${{m.next_class||'—'}}</td>
-      <td style="text-align:center;font-weight:500">${{m.visits}}</td>
-      <td style="font-size:10px;color:#847366;font-style:italic;max-width:140px">${{m.last_note?'"'+m.last_note.slice(0,60)+(m.last_note.length>60?'…':'')+'"':'—'}}</td>
-      <td style="text-align:center">${{ck(m.email,'contactado')}}</td>
-      <td><input type="text" placeholder="Nota equipo..." value="${{noteVal}}" onchange="setN('${{esc(m.email)}}','note',this.value)" style="min-width:130px"></td>
-    </tr>`;
-  }}).join(''):'<tr><td colspan="9" class="empty">Sin datos</td></tr>';
+function tagPills(tags){{return tags.filter(t=>SHOW_TAGS.includes(t)).map(t=>`<span class="pill ${{TAG_COLORS[t]||'p-grey'}}">${{t}}</span>`).join('');}}
+
+function noteCell(m){{
+  const note = m.last_note || '';
+  const link = `<a href="${{m.momence_url}}" target="_blank" class="note-link">+ añadir nota</a>`;
+  return note ? `<span style="font-style:italic;color:#847366">"${{note.slice(0,50)}}${{note.length>50?'…':''}}"</span> ${{link}}` : link;
 }}
 
-function filterByTag(tag){{
-  document.querySelectorAll('#tbl-members tbody tr').forEach(tr=>{{
-    tr.style.display=!tag||tr.textContent.includes(tag)?'':'none';
-  }});
+function renderActivos(){{
+  const ms = MEMBERS.filter(m=>m.tags.includes('Member')&&!m.is_platform);
+  document.getElementById('body-activos').innerHTML = ms.length ? ms.map(m=>{{
+    const ls = m.last_seen ? new Date(m.last_seen).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit'}}) : '—';
+    return`<tr>
+      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
+      <td>${{tagPills(m.tags)}}</td>
+      <td style="font-size:11px">${{m.membership_summary||'—'}}</td>
+      <td style="font-size:11px;color:${{m.days_inactive>21?'#a32d2d':m.days_inactive>14?'#854f0b':'#3b6d11'}}">${{ls}} <span style="font-size:10px">(${{m.days_inactive}}d)</span></td>
+      <td style="font-size:11px">${{m.next_class||'—'}}</td>
+      <td style="text-align:center;font-weight:500">${{m.visits}}</td>
+      <td style="font-size:11px">${{noteCell(m)}}</td>
+    </tr>`;
+  }}).join('') : '<tr><td colspan="7" class="empty">Sin members activos</td></tr>';
+}}
+
+function renderRefrescar(){{
+  const ms = MEMBERS.filter(m=>m.tags.includes('Member')&&!m.is_platform&&m.days_inactive>14).sort((a,b)=>b.days_inactive-a.days_inactive);
+  document.getElementById('body-refrescar').innerHTML = ms.length ? ms.map(m=>{{
+    const ls = m.last_seen ? new Date(m.last_seen).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit',year:'2-digit'}}) : '—';
+    const dcColor = m.days_inactive>21?'#a32d2d':'#854f0b';
+    return`<tr>
+      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
+      <td>${{tagPills(m.tags)}}</td>
+      <td style="font-size:11px">${{m.membership_summary||'—'}}</td>
+      <td style="font-size:11px">${{ls}}</td>
+      <td style="font-weight:500;color:${{dcColor}}">${{m.days_inactive}}d</td>
+      <td style="font-size:11px">${{m.next_class||'—'}}</td>
+      <td style="font-size:11px">${{noteCell(m)}}</td>
+    </tr>`;
+  }}).join('') : '<tr><td colspan="7" class="empty">Todos los members han venido recientemente</td></tr>';
 }}
 
 function renderIntro(){{
-  const intros=MEMBERS.filter(m=>m.tags.includes('introjourney')||m.tags.includes('member potencial'));
-  document.getElementById('body-intro').innerHTML=intros.length?intros.sort((a,b)=>b.visits-a.visits).map(m=>{{
-    const v=m.visits;
-    const [estado,ecls]=v>=3?['Clase 3 — CONVERTIR HOY','p-danger']:v===2?['Clase 2 — preparar conversión','p-warn']:v===1?['Clase 1 — seguimiento','p-info']:['Aún no ha venido','p-grey'];
+  const intros = MEMBERS.filter(m=>m.is_intro&&!m.is_platform).sort((a,b)=>a.intro_classes_left-b.intro_classes_left);
+  document.getElementById('body-intro').innerHTML = intros.length ? intros.map(m=>{{
+    const left = m.intro_classes_left;
+    const used = m.intro_classes_used;
+    const total = m.intro_classes_total;
+    let urgLabel, urgCls;
+    if(left===0){{urgLabel='🔴 Sin clases — URGENTE';urgCls='p-danger';}}
+    else if(left===1){{urgLabel='🟠 1 restante — HABLAR HOY';urgCls='p-warn';}}
+    else if(used>=2){{urgLabel='🟡 Momento de convertir';urgCls='p-warn';}}
+    else{{urgLabel='🟢 Seguimiento';urgCls='p-ok';}}
+    const expiry = m.intro_expiry_days!==null ? `${{m.intro_expiry_days}}d` : '—';
     return`<tr>
-      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a></td>
-      <td style="font-size:11px;color:#847366">${{m.email}}</td>
-      <td style="text-align:center;font-weight:500">${{v}}</td>
-      <td>${{pl(estado,ecls)}}</td>
+      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
+      <td style="text-align:center">
+        <span style="font-size:13px;font-weight:500">${{used}}/${{total}}</span>
+        <div style="font-size:10px;color:#847366">${{left}} restante${{left!==1?'s':''}}</div>
+      </td>
+      <td>${{pl(urgLabel,urgCls)}}</td>
+      <td style="font-size:11px;color:#aaa">${{m.prev_class||'—'}}</td>
       <td style="font-size:11px">${{m.next_class||'—'}}</td>
-      <td style="font-size:11px">${{m.membership_summary||'—'}}</td>
-      <td style="text-align:center">${{ck(m.email,'c_intro')}}</td>
-      <td>${{nf(m.email,'n_intro')}}</td>
+      <td style="text-align:center;color:${{m.intro_expiry_days!==null&&m.intro_expiry_days<=7?'#a32d2d':'#847366'}};font-size:11px">${{expiry}}</td>
+      <td style="font-size:11px">${{noteCell(m)}}</td>
     </tr>`;
-  }}).join(''):'<tr><td colspan="8" class="empty">Sin Intro Journeys activos</td></tr>';
+  }}).join('') : '<tr><td colspan="7" class="empty">Sin Intro Journeys activos</td></tr>';
 }}
 
 function renderPotenciales(){{
-  const pots=MEMBERS.filter(m=>!m.tags.includes('Member')&&!m.tags.includes('introjourney')&&!m.tags.includes('member potencial')&&m.days_inactive>30&&m.visits>0).sort((a,b)=>b.visits-a.visits);
-  document.getElementById('body-pot').innerHTML=pots.length?pots.map(m=>{{
-    const ls=m.last_seen?new Date(m.last_seen).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit',year:'2-digit'}}):'—';
+  const pots = MEMBERS.filter(m=>
+    !m.is_platform &&
+    !m.tags.includes('Member') &&
+    !m.is_intro &&
+    m.days_inactive>30 &&
+    m.visits>0
+  ).sort((a,b)=>b.visits-a.visits);
+  document.getElementById('body-pot').innerHTML = pots.length ? pots.map(m=>{{
+    const ls = m.last_seen ? new Date(m.last_seen).toLocaleDateString('es-ES',{{day:'2-digit',month:'2-digit',year:'2-digit'}}) : '—';
     return`<tr>
       <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a></td>
       <td style="font-size:11px;color:#847366">${{m.email}}</td>
@@ -614,61 +754,49 @@ function renderPotenciales(){{
       <td style="font-size:11px">${{ls}}</td>
       <td style="text-align:center;font-weight:500">${{m.visits}}</td>
       <td style="text-align:center;color:#847366">${{m.days_inactive}}d</td>
-      <td style="text-align:center">${{ck(m.email,'c_pot')}}</td>
-      <td>${{nf(m.email,'n_pot')}}</td>
+      <td style="font-size:11px">${{noteCell(m)}}</td>
     </tr>`;
-  }}).join(''):'<tr><td colspan="8" class="empty">Sin potenciales</td></tr>';
+  }}).join('') : '<tr><td colspan="7" class="empty">Sin potenciales</td></tr>';
 }}
 
 function renderBriefing(){{
-  const today=new Date().toLocaleDateString('es-ES',{{weekday:'long',day:'numeric',month:'long'}});
-  const hp=TASKS_TODAY.filter(t=>!n(t.email+'_'+t.type).done);
-  const wp=TASKS_WEEK.filter(t=>!n(t.email+'_'+t.type).done);
-  let txt=`Briefing aretē · ${{today}}\\n${{Array(45).fill('─').join('')}}\\n\\n`;
-  txt+=`RESUMEN\\nMembers activos: {stats['active_members']} / 300 (${{Math.round({stats['active_members']}/3)}}%)\\nTareas hoy pendientes: ${{hp.length}} · Esta semana: ${{wp.length}}\\n\\n`;
-  const sinM=hp.filter(t=>t.type==='sin_metodo_pago');
+  const today = new Date().toLocaleDateString('es-ES',{{weekday:'long',day:'numeric',month:'long'}});
+  let txt = `Briefing aretē · ${{today}}\\n${{Array(45).fill('─').join('')}}\\n\\n`;
+  txt += `RESUMEN\\nMembers activos: {stats['active_members']} / 300 (${{Math.round({stats['active_members']}/3)}}%)\\n`;
+  txt += `Tareas hoy: ${{TASKS_TODAY.length}} · Esta semana: ${{TASKS_WEEK.length}}\\n\\n`;
+
+  const sinM = TASKS_TODAY.filter(t=>t.type==='sin_metodo_pago');
   if(sinM.length){{txt+=`SIN MÉTODO DE PAGO — HOY (${{sinM.length}})\\n`;sinM.forEach(t=>txt+=`· ${{t.name}} — ${{t.detail}}\\n`);txt+='\\n';}}
-  const packs=hp.filter(t=>t.type==='pack_expirando');
+
+  const packs = TASKS_TODAY.filter(t=>t.type==='pack_expirando');
   if(packs.length){{txt+=`PACKS TERMINAN HOY (${{packs.length}})\\n`;packs.forEach(t=>txt+=`· ${{t.name}} — ${{t.nc||''}}\\n`);txt+='\\n';}}
-  const intros=hp.filter(t=>t.type==='intro_journey');
+
+  const intros = TASKS_TODAY.filter(t=>t.type==='intro_journey');
   if(intros.length){{txt+=`INTRO JOURNEY — ACCIÓN HOY (${{intros.length}})\\n`;intros.forEach(t=>txt+=`· ${{t.name}} — ${{t.action}}\\n`);txt+='\\n';}}
-  if(wp.length){{
+
+  const semana = TASKS_WEEK.slice(0,10);
+  if(semana.length){{
     txt+=`PRÓXIMAS ACCIONES ESTA SEMANA\\n`;
-    wp.slice(0,10).forEach(t=>{{const nota=n(t.email+'_'+t.type).note;txt+=`· ${{t.name}} — ${{t.action}}${{t.nc?' ('+t.nc+')':''}}${{nota?' — '+nota:''}}\\n`;}});
-    if(wp.length>10)txt+=`· ...y ${{wp.length-10}} más\\n`;
+    semana.forEach(t=>txt+=`· ${{t.name}} — ${{t.action}}${{t.nc?' (${{t.nc}})':''}}\\n`);
+    if(TASKS_WEEK.length>10)txt+=`· ...y ${{TASKS_WEEK.length-10}} más\\n`;
   }}
-  txt+=`\\n${{Array(45).fill('─').join('')}}\\nGenerado automáticamente · aretē · {TODAY_STR}`;
-  document.getElementById('briefing-text').textContent=txt;
+  txt += `\\n${{Array(45).fill('─').join('')}}\\nGenerado automáticamente · aretē · {TODAY_STR}`;
+  document.getElementById('briefing-text').textContent = txt;
 }}
 
 function copyBriefing(){{navigator.clipboard.writeText(document.getElementById('briefing-text').textContent).then(()=>toast('Briefing copiado'));}}
 
-function saveNotes(){{
-  const b=new Blob([JSON.stringify(NOTES,null,2)],{{type:'application/json'}});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(b);
-  a.download='arete_notas_'+new Date().toISOString().slice(0,10)+'.json';
-  a.click();
-  toast('Notas guardadas');
-}}
-
-function importNotes(e){{
-  const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();
-  r.onload=ev=>{{
-    try{{Object.assign(NOTES,JSON.parse(ev.target.result));renderAll();toast('Notas cargadas: '+Object.keys(NOTES).length+' personas');}}
-    catch{{toast('Error al cargar notas');}}
-  }};
-  r.readAsText(f);e.target.value='';
-}}
-
-function renderAll(){{
-  filterList('today',fT);filterList('week',fW);
-  renderMembers();renderIntro();renderPotenciales();
+function init(){{
+  filterList('today','');
+  filterList('week','');
+  renderActivos();
+  renderRefrescar();
+  renderIntro();
+  renderPotenciales();
   updateCounts();
 }}
 
-renderAll();
+init();
 </script>
 </body>
 </html>'''
@@ -682,48 +810,47 @@ def main():
     tag_ids = fetch_all_tags(token)
     print(f'   {len(tag_ids)} tags encontrados')
 
-    print('👥 Cargando todos los members...')
+    print('👥 Cargando members...')
     all_members = fetch_all_members(token)
     print(f'✅ {len(all_members)} members cargados')
 
     RELEVANT = {'Member','FORMER MEMBER','member potencial','introjourney','DUCK','INFLU','MANUAL','CASH','PAGO FALLIDO','NO CANCELAR!'}
     relevant_members = []
     for m in all_members:
-        member_tag_names = {t['name'] for t in m.get('customerTags', [])}
+        tag_names = {t['name'] for t in m.get('customerTags', [])}
         visits = m.get('visits', {}).get('totalVisits', 0)
-        if bool(member_tag_names & RELEVANT) or visits >= 3:
+        if bool(tag_names & RELEVANT) or visits >= 3:
             relevant_members.append(m)
 
     print(f'   Procesando {len(relevant_members)} members relevantes...')
-
     members_data = []
     for i, member in enumerate(relevant_members):
-        if i % 20 == 0:
-            print(f'   {i}/{len(relevant_members)}...')
+        if i % 20 == 0: print(f'   {i}/{len(relevant_members)}...')
         if i > 0 and i % 80 == 0:
             print('   Refrescando token...')
             token = get_token()
         result = process_member(token, member, tag_ids)
-        if result:
-            members_data.append(result)
+        if result: members_data.append(result)
 
     print(f'✅ {len(members_data)} members procesados')
 
-    active_count = sum(1 for m in members_data if 'Member' in m['tags'])
-    intro_count = sum(1 for m in members_data if 'introjourney' in m['tags'] or 'member potencial' in m['tags'])
-    potencial_count = sum(1 for m in members_data if
+    active = sum(1 for m in members_data if 'Member' in m['tags'] and not m['is_platform'])
+    intro = sum(1 for m in members_data if m['is_intro'] and not m['is_platform'])
+    potencial = sum(1 for m in members_data if
+        not m['is_platform'] and
         not any(t in m['tags'] for t in ['Member','introjourney','member potencial']) and
         m['days_inactive'] > 30 and m['visits'] > 0)
     no_pm = sum(1 for m in members_data if
-        'Member' in m['tags'] and
-        not any(t in m['tags'] for t in ['PM','MANUAL','CASH']))
+        'Member' in m['tags'] and not m['is_platform'] and not m['has_pm'])
+    to_refresh = sum(1 for m in members_data if
+        'Member' in m['tags'] and not m['is_platform'] and m['days_inactive'] > 14)
 
     stats = {
-        'total_members': len(members_data),
-        'active_members': active_count,
-        'intro_count': intro_count,
-        'potenciales': potencial_count,
+        'active_members': active,
+        'intro_count': intro,
+        'potenciales': potencial,
         'no_payment_method': no_pm,
+        'to_refresh': to_refresh,
     }
 
     print('📋 Construyendo tareas...')
@@ -738,10 +865,11 @@ def main():
         f.write(html)
 
     print('✅ Dashboard generado')
-    print(f'   Members activos: {active_count} / 300')
-    print(f'   Intro Journey: {intro_count}')
-    print(f'   Potenciales: {potencial_count}')
+    print(f'   Members activos: {active} / 300')
+    print(f'   Intro Journey: {intro}')
+    print(f'   Potenciales: {potencial}')
     print(f'   Sin método pago: {no_pm}')
+    print(f'   A refrescar: {to_refresh}')
     print(f'   Tareas hoy: {len(tasks_today)}')
     print(f'   Tareas semana: {len(tasks_week)}')
 
