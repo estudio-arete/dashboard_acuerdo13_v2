@@ -1073,13 +1073,35 @@ def main():
 
     print(f'   Procesando {len(relevant)} relevantes...')
     members_data = []
+    debug_done = False
     for i, member in enumerate(relevant):
         if i % 20 == 0: print(f'   {i}/{len(relevant)}...')
         if i > 0 and i % 80 == 0:
             print('   Refrescando token...')
             token = get_token()
         result = process_member(token, member, tag_ids)
-        if result: members_data.append(result)
+        if result:
+            members_data.append(result)
+            # Debug: print first member with active subscription
+            if not debug_done and result.get('has_subscription'):
+                print(f'\n🔍 DEBUG member con suscripción: {result["name"]}')
+                print(f'   membership_summary: {result["membership_summary"]}')
+                print(f'   mrr: {result["mrr"]}')
+                print(f'   renewal_days: {result["renewal_days"]}')
+                print(f'   has_pm: {result["has_pm"]}')
+                print(f'   tags: {result["tags"]}')
+                print(f'   next_class_days: {result["next_class_days"]}')
+                # Print raw membership data
+                active = fetch_active_memberships(token, member['id'])
+                if active:
+                    import json as j
+                    print(f'   raw membership keys: {list(active[0].keys())}')
+                    print(f'   membership.price: {active[0].get("price")}')
+                    print(f'   membership.membership: {j.dumps(active[0].get("membership",{}), ensure_ascii=False)[:200]}')
+                    print(f'   membership.type: {active[0].get("type")}')
+                    print(f'   membership.autoRenewing: {active[0].get("autoRenewing")}')
+                    print(f'   membership.paymentMethod: {active[0].get("paymentMethod")}')
+                debug_done = True
 
     print(f'✅ {len(members_data)} procesados')
 
@@ -1127,6 +1149,20 @@ def main():
     print('📋 Construyendo tareas...')
     tasks_today, tasks_week = build_tasks(members_data)
     print(f'   Hoy: {len(tasks_today)} · Semana: {len(tasks_week)}')
+    # Debug tasks week
+    print(f'\n🔍 DEBUG tareas semana:')
+    for t in tasks_week[:5]:
+        print(f'   {t["type"]} · {t["name"]} · nc_days:{t.get("nc_days")} · sd:{t.get("sd")}')
+    # Debug sin PM count
+    sin_pm = [m for m in members_data if m and 'Member' in m['tags'] and not m['is_platform'] and not m['has_pm'] and m['has_subscription']]
+    print(f'\n🔍 Sin PM con suscripción: {len(sin_pm)}')
+    for m in sin_pm[:5]:
+        print(f'   {m["name"]} · renewal:{m["renewal_days"]} · nc_days:{m["next_class_days"]}')
+    # Debug pack alerts
+    pack_alerts = [m for m in members_data if m and m.get('pack_alert')]
+    print(f'\n🔍 Pack alerts: {len(pack_alerts)}')
+    for m in pack_alerts[:5]:
+        print(f'   {m["name"]} · left:{m["pack_credits_left"]}/{m["pack_credits_total"]} · nc_days:{m["next_class_days"]}')
 
     print('🏗️  Generando dashboard...')
     html = generate_html(members_data, tasks_today, tasks_week, stats)
