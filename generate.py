@@ -186,6 +186,13 @@ def remove_tag(token, mid, tag_id):
 def format_session(s_obj, show_coach=False):
     if not s_obj: return None
     dt = s_obj['dt']
+    # Convert to Madrid time
+    try:
+        from zoneinfo import ZoneInfo
+        madrid = ZoneInfo('Europe/Madrid')
+        dt = dt.astimezone(madrid)
+    except:
+        dt = dt + timedelta(hours=1)
     name = s_obj['data'].get('session', {}).get('name', '')
     result = dt.strftime('%d/%m %H:%M') + ' · ' + name.split('·')[0].strip()
     if show_coach and s_obj.get('coach'):
@@ -305,7 +312,16 @@ def process_member(token, member, tag_ids, membership_prices=None):
     prev_session = past_sessions[0] if past_sessions else None
     next_class = format_session(next_session, show_coach=True)
     prev_class = format_session(prev_session, show_coach=True)
-    next_class_days = (next_session['dt'].date() - TODAY_DATE).days if next_session else None
+    if next_session:
+        try:
+            from zoneinfo import ZoneInfo
+            madrid_dt = next_session['dt'].astimezone(ZoneInfo('Europe/Madrid'))
+            today_madrid = TODAY.astimezone(ZoneInfo('Europe/Madrid')).date()
+            next_class_days = (madrid_dt.date() - today_madrid).days
+        except:
+            next_class_days = (next_session['dt'].date() - TODAY_DATE).days
+    else:
+        next_class_days = None
     next_coach = next_session['coach'] if next_session else None
 
     # Past coaches (unique, last 3)
@@ -595,13 +611,14 @@ def generate_html(members_data, tasks_today, tasks_week, stats):
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{font-family:'DM Sans',-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;font-size:13px;color:#222323;background:#f7f7f7;min-height:100vh}}
 .app{{padding:1rem;max-width:1100px;margin:0 auto}}
-.topbar{{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;padding:0.85rem 1.25rem;border-radius:6px;background:#222323;color:#fff;flex-wrap:wrap;gap:8px}}
-.brand{{font-size:15px;font-weight:400;letter-spacing:0.08em;color:#fff}}
-.brand em{{font-weight:300;color:#847366;font-size:11px;margin-left:10px;font-style:normal;letter-spacing:0.04em}}
-.update-info{{font-size:10px;color:#847366;margin-top:2px}}
+.topbar{{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;padding:0.85rem 1.25rem;border-radius:6px;background:#27303d;color:#fff;flex-wrap:wrap;gap:8px}}
+.brand{{display:flex;align-items:center;gap:12px}}
+.brand-logo{{height:28px;opacity:0.95}}
+.brand em{{font-weight:300;color:#8fa0b8;font-size:11px;margin-left:4px;font-style:normal;letter-spacing:0.04em}}
+.update-info{{font-size:10px;color:#8fa0b8;margin-top:2px}}
 .topbar-actions{{display:flex;gap:6px;align-items:center}}
-.btn-refresh{{font-size:11px;padding:6px 14px;border:1px solid #27303d;border-radius:4px;background:#27303d;color:#fff;cursor:pointer;letter-spacing:0.03em;font-family:inherit}}
-.btn-refresh:hover{{background:#1e2530}}
+.btn-refresh{{font-size:11px;padding:6px 14px;border:1px solid rgba(216,227,244,0.3);border-radius:4px;background:rgba(216,227,244,0.1);color:#d8e3f4;cursor:pointer;letter-spacing:0.03em;font-family:inherit}}
+.btn-refresh:hover{{background:rgba(216,227,244,0.2)}}
 .metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:1rem}}
 .metric{{background:#fff;border-radius:4px;padding:0.75rem;text-align:center;border:1px solid #ebebeb}}
 .metric .n{{font-size:24px;font-weight:300;line-height:1.2;letter-spacing:-0.02em}}
@@ -840,9 +857,18 @@ tr:hover td{{background:#fafafa}}
           <div style="font-size:11px;color:#847366;margin-top:4px">Por member activo</div>
         </div>
       </div>
-      <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+      <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem;margin-bottom:1rem">
         <div style="font-size:11px;font-weight:500;letter-spacing:0.04em;margin-bottom:1rem">DESGLOSE MRR POR MEMBRESÍA</div>
         <div id="mrr-breakdown"></div>
+      </div>
+      <div style="background:#fff;border:1px solid #ebebeb;border-radius:4px;padding:1.25rem">
+        <div style="font-size:11px;font-weight:500;letter-spacing:0.04em;margin-bottom:1rem">MRR EN RIESGO — SIN MÉTODO DE PAGO</div>
+        <div class="tbl-wrap" style="max-height:300px">
+          <table id="tbl-mrr-riesgo">
+            <thead><tr><th>Nombre</th><th>Membresía</th><th>MRR</th><th>Renueva en</th><th>Próxima clase</th></tr></thead>
+            <tbody id="body-mrr-riesgo"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -1057,7 +1083,25 @@ function renderNotes(notes){{
   return items;
 }}
 
+function renderMrrRiesgo(){{
+  const ms = MEMBERS.filter(m=>m.tags.includes('Member')&&!m.is_platform&&!m.has_pm&&m.has_subscription);
+  const tbody = document.getElementById('body-mrr-riesgo');
+  if(!tbody) return;
+  tbody.innerHTML = ms.length ? ms.sort((a,b)=>(a.renewal_days||99)-(b.renewal_days||99)).map(m=>{{
+    const renewal = m.renewal_days!==null&&m.renewal_days!==undefined ? `${{m.renewal_days}}d` : '—';
+    const urgColor = m.renewal_days!==null&&m.renewal_days<=7 ? '#222323' : '#847366';
+    return`<tr>
+      <td><a href="${{m.momence_url}}" target="_blank" class="member-link">${{m.name}}</a><div style="font-size:10px;color:#847366">${{m.email}}</div></td>
+      <td style="font-size:11px">${{m.membership_summary.split('·')[0].trim()}}</td>
+      <td style="font-weight:500">${{m.mrr>0?m.mrr.toFixed(0)+'€':'—'}}</td>
+      <td style="color:${{urgColor}};font-weight:${{m.renewal_days!==null&&m.renewal_days<=7?'500':'400'}}">${{renewal}}</td>
+      <td style="font-size:11px">${{m.next_class||'—'}}</td>
+    </tr>`;
+  }}).join('') : '<tr><td colspan="5" class="empty">Sin members con MRR en riesgo</td></tr>';
+}}
+
 function renderEconomia(){{
+  renderMrrRiesgo();
   const MRR_BREAKDOWN={mrr_breakdown_json};
   const el=document.getElementById('mrr-breakdown');
   if(!el)return;
