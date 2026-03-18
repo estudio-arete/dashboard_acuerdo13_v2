@@ -96,6 +96,36 @@ def fetch_all_tags(token):
     data = api_get(token, '/api/v2/host/tags', {'page': 0, 'pageSize': 100})
     return {t['name']: t['id'] for t in data.get('payload', [])}
 
+def fetch_membership_prices(token):
+    """Fetch catalog prices for all memberships"""
+    data = api_get(token, '/api/v2/host/memberships', {'page': 0, 'pageSize': 100})
+    prices = {}
+    for m in data.get('payload', []):
+        mid = m.get('id')
+        price = m.get('price') or m.get('monthlyPrice') or m.get('amount') or 0
+        if mid and price:
+            try:
+                prices[mid] = float(price)
+            except:
+                pass
+    # Try second page
+    total = data.get('pagination', {}).get('totalCount', 0)
+    if total > 100:
+        data2 = api_get(token, '/api/v2/host/memberships', {'page': 1, 'pageSize': 100})
+        for m in data2.get('payload', []):
+            mid = m.get('id')
+            price = m.get('price') or m.get('monthlyPrice') or m.get('amount') or 0
+            if mid and price:
+                try:
+                    prices[mid] = float(price)
+                except:
+                    pass
+    print(f'   Precios de membresías: {len(prices)} encontrados')
+    if prices:
+        sample = list(prices.items())[:3]
+        print(f'   Ejemplo precios: {sample}')
+    return prices
+
 def fetch_active_memberships(token, mid):
     data = api_get(token, f'/api/v2/host/members/{mid}/bought-memberships/active', {'page': 0, 'pageSize': 10})
     return data.get('payload', [])
@@ -173,7 +203,7 @@ def is_clase_prueba(mem):
 def is_subscription(mem):
     return mem.get('type') == 'subscription'
 
-def process_member(token, member, tag_ids):
+def process_member(token, member, tag_ids, membership_prices=None):
     mid = member['id']
     tag_names = [t['name'] for t in member.get('customerTags', [])]
     tag_id_map = {t['name']: t['id'] for t in member.get('customerTags', [])}
@@ -197,22 +227,27 @@ def process_member(token, member, tag_ids):
     has_subscription = any(is_subscription(m) for m in own_active_mems)
     has_future = len(future_sessions) > 0
 
-    # Pack credits - for non-subscription memberships
+    # Pack credits - for non-subscription memberships (packs)
+    # A pack: has usageLimitForSessions, is NOT a subscription type
     pack_credits_left = None
     pack_credits_total = None
     pack_alert = False
     for m in own_active_mems:
-        if not is_subscription(m) and not is_intro_journey(m) and not is_clase_prueba(m):
-            used = m.get('usedSessions') or 0
-            total = m.get('usageLimitForSessions')
-            if total:
-                left = max(0, total - used)
-                pack_credits_left = left
-                pack_credits_total = total
-                # Alert when <=20% remaining
-                threshold = max(1, round(total * 0.20))
-                pack_alert = left <= threshold
-                break
+        mem_type = m.get('type', '')
+        mem_name = m.get('membership', {}).get('name', '').lower()
+        # Skip subscriptions, intro journeys, clases de prueba
+        if mem_type == 'subscription': continue
+        if 'intro journey' in mem_name or 'clase de prueba' in mem_name: continue
+        used = m.get('usedSessions') or 0
+        total = m.get('usageLimitForSessions')
+        if total and total > 1:  # ignore single-use packs
+            left = max(0, total - used)
+            pack_credits_left = left
+            pack_credits_total = total
+            # Alert when <=20% remaining (min 1)
+            threshold = max(1, round(total * 0.20))
+            pack_alert = left <= threshold
+            break
     # Use last checked-in session for accurate inactivity, fallback to lastSeen
     last_checkin = get_last_checkin_date(past_sessions)
     if last_checkin:
@@ -323,18 +358,16 @@ def process_member(token, member, tag_ids):
 
     last_note = notes[0].get('content', '').strip() if notes else ''
     formatted_notes = format_notes(notes)
-    has_pm = 'PM' in tag_names or 'MANUAL' in tag_names or 'CASH' in tag_names
+    has_pm = 'PM' in tag_names  # everyone needs a saved payment method
 
-    # MRR calculation - sum of all active subscription amounts
+    # MRR calculation - look up price from membership catalog
     mrr = 0.0
-    for m in own_active_mems:
-        if is_subscription(m):
-            # Get renewal amount from membership
-            price = m.get('membership', {}).get('price', 0) or 0
-            try:
-                mrr += float(price)
-            except:
-                pass
+    if membership_prices:
+        for m in own_active_mems:
+            if is_subscription(m):
+                mem_id = m.get('membership', {}).get('id')
+                if mem_id and mem_id in membership_prices:
+                    mrr += membership_prices[mem_id]
 
     return {
         'id': mid,
@@ -410,46 +443,48 @@ def build_tasks(members_data):
                 tasks_today.append(item)
 
         # Sin PM + suscripción que renueva pronto
-        if not m['has_pm'] and m['has_subscription'] and m['renewal_days'] is not None and m['renewal_days'] <= 7:
-            key = f"{email}_sin_metodo_pago"
-            if key not in seen:
-                seen.add(key)
-                item = {
-                    'type': 'sin_metodo_pago',
-                    'name': m['name'], 'email': email,
-                    'detail': m['membership_summary'],
-                    'action': 'Conseguir método de pago antes de la renovación',
-                    'nc': m['next_class'], 'nc_days': nc_days,
-                    'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
-                    'next_coach': m['next_coach'],
-                    'last_note': m['last_note'],
-                    'formatted_notes': m.get('formatted_notes', []),
-                    'momence_url': m['momence_url'],
-                    'momence_notes_url': m['momence_notes_url'],
-                    'priority': 2, 'sd': nc_days if nc_days is not None else 99
-                }
-                if nc_days == 0: tasks_today.append(item)
-                else: tasks_week.append(item)
-
-        # Reminder metodo de pago el dia que vienen
-        if not m['has_pm'] and m['has_subscription'] and nc_days == 0:
-            key = f"{email}_pm_reminder_hoy"
-            if key not in seen:
-                seen.add(key)
-                tasks_today.append({
-                    'type': 'pm_reminder',
-                    'name': m['name'], 'email': email,
-                    'detail': f"Viene hoy · {m['next_class']} · sin método de pago guardado",
-                    'action': 'Pedir método de pago al llegar — tarjeta o cuenta bancaria',
-                    'nc': m['next_class'], 'nc_days': 0,
-                    'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
-                    'next_coach': m['next_coach'],
-                    'last_note': m['last_note'],
-                    'formatted_notes': m.get('formatted_notes', []),
-                    'momence_url': m['momence_url'],
-                    'momence_notes_url': m['momence_notes_url'],
-                    'priority': 2, 'sd': 0
-                })
+        # Sin PM - todos los members con suscripción sin método de pago
+        if not m['has_pm'] and m['has_subscription']:
+            # HOY: viene hoy → pedir PM en persona
+            if nc_days == 0:
+                key = f"{email}_pm_hoy"
+                if key not in seen:
+                    seen.add(key)
+                    renewal_info = f" · renueva en {m['renewal_days']}d" if m['renewal_days'] is not None else ""
+                    tasks_today.append({
+                        'type': 'pm_reminder',
+                        'name': m['name'], 'email': email,
+                        'detail': f"Viene hoy · sin método de pago{renewal_info}",
+                        'action': 'Pedir método de pago al llegar — tarjeta o cuenta bancaria',
+                        'nc': m['next_class'], 'nc_days': 0,
+                        'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
+                        'next_coach': m['next_coach'],
+                        'last_note': m['last_note'],
+                        'momence_url': m['momence_url'],
+                        'momence_notes_url': m['momence_notes_url'],
+                        'priority': 2, 'sd': 0
+                    })
+            # SEMANA: los que no vienen hoy → contactar por WhatsApp
+            else:
+                key = f"{email}_sin_metodo_pago"
+                if key not in seen:
+                    seen.add(key)
+                    renewal_days = m['renewal_days'] if m['renewal_days'] is not None else 99
+                    urgency = 1 if renewal_days <= 3 else 2 if renewal_days <= 7 else 3
+                    tasks_week.append({
+                        'type': 'sin_metodo_pago',
+                        'name': m['name'], 'email': email,
+                        'detail': m['membership_summary'],
+                        'action': 'Conseguir método de pago — contactar por WhatsApp',
+                        'nc': m['next_class'], 'nc_days': nc_days,
+                        'prev_class': m['prev_class'], 'past_coaches': m['past_coaches'],
+                        'next_coach': m['next_coach'],
+                        'last_note': m['last_note'],
+                        'momence_url': m['momence_url'],
+                        'momence_notes_url': m['momence_notes_url'],
+                        'priority': urgency,
+                        'sd': renewal_days
+                    })
 
         # Reservas unpaid sin membresía activa (avisar 2 días antes)
         for unpaid in m['unpaid_future']:
@@ -1059,6 +1094,9 @@ def main():
     tag_ids = fetch_all_tags(token)
     print(f'   {len(tag_ids)} tags')
 
+    print('💶  Cargando precios de membresías...')
+    membership_prices = fetch_membership_prices(token)
+
     print('👥 Cargando members...')
     all_members = fetch_all_members(token)
     print(f'✅ {len(all_members)} members')
@@ -1073,35 +1111,13 @@ def main():
 
     print(f'   Procesando {len(relevant)} relevantes...')
     members_data = []
-    debug_done = False
     for i, member in enumerate(relevant):
         if i % 20 == 0: print(f'   {i}/{len(relevant)}...')
         if i > 0 and i % 80 == 0:
             print('   Refrescando token...')
             token = get_token()
-        result = process_member(token, member, tag_ids)
-        if result:
-            members_data.append(result)
-            # Debug: print first member with active subscription
-            if not debug_done and result.get('has_subscription'):
-                print(f'\n🔍 DEBUG member con suscripción: {result["name"]}')
-                print(f'   membership_summary: {result["membership_summary"]}')
-                print(f'   mrr: {result["mrr"]}')
-                print(f'   renewal_days: {result["renewal_days"]}')
-                print(f'   has_pm: {result["has_pm"]}')
-                print(f'   tags: {result["tags"]}')
-                print(f'   next_class_days: {result["next_class_days"]}')
-                # Print raw membership data
-                active = fetch_active_memberships(token, member['id'])
-                if active:
-                    import json as j
-                    print(f'   raw membership keys: {list(active[0].keys())}')
-                    print(f'   membership.price: {active[0].get("price")}')
-                    print(f'   membership.membership: {j.dumps(active[0].get("membership",{}), ensure_ascii=False)[:200]}')
-                    print(f'   membership.type: {active[0].get("type")}')
-                    print(f'   membership.autoRenewing: {active[0].get("autoRenewing")}')
-                    print(f'   membership.paymentMethod: {active[0].get("paymentMethod")}')
-                debug_done = True
+        result = process_member(token, member, tag_ids, membership_prices)
+        if result: members_data.append(result)
 
     print(f'✅ {len(members_data)} procesados')
 
@@ -1113,6 +1129,7 @@ def main():
         m['days_inactive'] > 30 and m['visits'] > 0)
     no_pm = sum(1 for m in members_data if
         'Member' in m['tags'] and not m['is_platform'] and not m['has_pm'] and m['has_subscription'])
+    # Note: MANUAL and CASH members still need PM - has_pm only true if tag PM present
     to_refresh = sum(1 for m in members_data if
         'Member' in m['tags'] and not m['is_platform'] and m['days_inactive'] > 14)
 
@@ -1149,20 +1166,6 @@ def main():
     print('📋 Construyendo tareas...')
     tasks_today, tasks_week = build_tasks(members_data)
     print(f'   Hoy: {len(tasks_today)} · Semana: {len(tasks_week)}')
-    # Debug tasks week
-    print(f'\n🔍 DEBUG tareas semana:')
-    for t in tasks_week[:5]:
-        print(f'   {t["type"]} · {t["name"]} · nc_days:{t.get("nc_days")} · sd:{t.get("sd")}')
-    # Debug sin PM count
-    sin_pm = [m for m in members_data if m and 'Member' in m['tags'] and not m['is_platform'] and not m['has_pm'] and m['has_subscription']]
-    print(f'\n🔍 Sin PM con suscripción: {len(sin_pm)}')
-    for m in sin_pm[:5]:
-        print(f'   {m["name"]} · renewal:{m["renewal_days"]} · nc_days:{m["next_class_days"]}')
-    # Debug pack alerts
-    pack_alerts = [m for m in members_data if m and m.get('pack_alert')]
-    print(f'\n🔍 Pack alerts: {len(pack_alerts)}')
-    for m in pack_alerts[:5]:
-        print(f'   {m["name"]} · left:{m["pack_credits_left"]}/{m["pack_credits_total"]} · nc_days:{m["next_class_days"]}')
 
     print('🏗️  Generando dashboard...')
     html = generate_html(members_data, tasks_today, tasks_week, stats)
