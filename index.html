@@ -104,7 +104,7 @@ tr:hover td{background:#fafafa}
   <div class="topbar">
     <div>
       <div class="brand">aretē <em>· sistema de gestión</em></div>
-      <div class="update-info">Actualizado: 21/03/2026 17:52 UTC · Se actualiza automáticamente cada hora</div>
+      <div class="update-info">Actualizado: 21/03/2026 19:02 UTC · Se actualiza automáticamente cada hora</div>
     </div>
     <div class="topbar-actions">
       <button class="btn-refresh" onclick="window.open('https://github.com/estudio-arete/dashboard_acuerdo13_v2/actions/workflows/update.yml','_blank');toast('Abre GitHub Actions → Run workflow')">
@@ -470,7 +470,7 @@ function renderBriefing(){
   if(intros.length){txt+=`intro journey — acción hoy (${intros.length})\n`;intros.forEach(t=>txt+=`· ${t.name} — ${t.action}\n`);txt+='\n';}
   const semana=TASKS_WEEK.slice(0,8);
   if(semana.length){txt+=`próximas acciones esta semana\n`;semana.forEach(t=>txt+=`· ${t.name} — ${t.action}${t.nc?' ('+t.nc+')':''}\n`);if(TASKS_WEEK.length>8)txt+=`· ...y ${TASKS_WEEK.length-8} más\n`;}
-  txt+=`\n${Array(44).fill('—').join('')}\naretē · 21/03/2026 17:52`;
+  txt+=`\n${Array(44).fill('—').join('')}\naretē · 21/03/2026 19:02`;
   document.getElementById('briefing-text').textContent=txt;
 }
 
