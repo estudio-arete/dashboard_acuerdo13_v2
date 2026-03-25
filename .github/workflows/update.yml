@@ -26,7 +26,7 @@ jobs:
           MOMENCE_EMAIL: ${{ secrets.MOMENCE_EMAIL }}
           MOMENCE_PASSWORD: ${{ secrets.MOMENCE_PASSWORD }}
           GH_REPO: ${{ github.repository }}
-        run: python generate.py
+        run: python diagnostico.py
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v3
