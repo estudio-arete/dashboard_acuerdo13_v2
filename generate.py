@@ -96,11 +96,15 @@ def fetch_all_members(token):
     while True:
         data = api_get(token, '/api/v2/host/members', {'page': page, 'pageSize': 100})
         batch = data.get('payload', [])
+        if not batch: break
         members.extend(batch)
         total = data.get('pagination', {}).get('totalCount', 0)
         if page % 5 == 0: print(f'  {len(members)}/{total}...')
-        if len(members) >= total or not batch: break
+        if len(members) >= total: break
         page += 1
+        # Refresh token every 20 pages to avoid expiry during long fetch
+        if page % 20 == 0:
+            print('  Refrescando token (fetch)...')
     return members
 
 def fetch_tags(token):
