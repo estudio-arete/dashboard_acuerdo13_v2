@@ -1,6 +1,8 @@
 name: Actualizar dashboard aretē
 
 on:
+  schedule:
+    - cron: '0 7-21 * * *'
   workflow_dispatch:
 
 jobs:
@@ -17,10 +19,17 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      - name: Run diagnostico
+      - name: Generate dashboard
         env:
           MOMENCE_CLIENT_ID: ${{ secrets.MOMENCE_CLIENT_ID }}
           MOMENCE_CLIENT_SECRET: ${{ secrets.MOMENCE_CLIENT_SECRET }}
           MOMENCE_EMAIL: ${{ secrets.MOMENCE_EMAIL }}
           MOMENCE_PASSWORD: ${{ secrets.MOMENCE_PASSWORD }}
-        run: python diagnostico.py
+          GH_REPO: ${{ github.repository }}
+        run: python generate.py
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./output
