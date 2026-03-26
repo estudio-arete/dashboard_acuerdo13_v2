@@ -138,7 +138,7 @@ def fetch_active_memberships(token, mid):
 def fetch_sessions(token, mid):
     """Returns (past_checkins, future_bookings) sorted"""
     data = api_get(token, f'/api/v2/host/members/{mid}/sessions',
-                   {'page': 0, 'pageSize': 20})
+                   {'page': 0, 'pageSize': 30})
     past, future = [], []
     for s in data.get('payload', []):
         starts = s.get('session', {}).get('startsAt', '')
@@ -250,6 +250,9 @@ def process_member(token, member, tag_ids, mem_prices):
     # Payment method — only PM tag counts
     has_pm = 'PM' in tag_names
 
+    # Declined renewal detection
+    declined_renewal = any(m.get('declinedRenewal') for m in subscription_mems)
+
     # MRR — sum of subscription prices from catalog
     mrr = 0.0
     for m in subscription_mems:
@@ -258,15 +261,17 @@ def process_member(token, member, tag_ids, mem_prices):
             mrr += mem_prices[mid_mem]
 
     # Pack info
-    pack_left = pack_total = pack_alert = None
+    pack_left = pack_total = pack_alert = pack_expiry_days = None
     if pack_mems:
         pm = pack_mems[0]
         used, total, left = get_credits(pm)
+        pack_expiry_days = get_renewal_days(pm)
         if total and total > 1:
             pack_left = left
             pack_total = total
             threshold = max(1, round(total * 0.20))
-            pack_alert = left <= threshold
+            # Alert if <=20% credits OR expiring in <=7 days
+            pack_alert = (left <= threshold) or (pack_expiry_days is not None and pack_expiry_days <= 7)
 
     # Intro info
     intro_used = intro_total = intro_left = intro_expiry = None
@@ -381,12 +386,14 @@ def process_member(token, member, tag_ids, mem_prices):
         'has_prueba': has_prueba,
         'has_future': has_future,
         'has_pm': has_pm,
+        'declined_renewal': declined_renewal,
         'mrr': mrr,
         'membership_summary': membership_summary,
         'renewal_days': renewal_days,
         'pack_left': pack_left,
         'pack_total': pack_total,
         'pack_alert': pack_alert,
+        'pack_expiry_days': pack_expiry_days,
         'intro_used': intro_used or 0,
         'intro_total': intro_total or 3,
         'intro_left': intro_left if intro_left is not None else 3,
@@ -471,11 +478,38 @@ def build_tasks(members):
         # Handled implicitly — if no active membership and has future session, it's unpaid context
 
         # ── 5. PACK EXPIRANDO ────────────────────────────────────────────────
-        if m['pack_alert'] and m['has_future']:
+        if m['pack_alert']:
+            credits_info = f"{m['pack_left']} de {m['pack_total']} clases" if m['pack_left'] is not None else ""
+            expiry_info = f" · caduca en {m['pack_expiry_days']}d" if m['pack_expiry_days'] is not None and m['pack_expiry_days'] <= 7 else ""
             add(task('pack_expirando',
-                f"Pack · {m['pack_left']} clase{'s' if m['pack_left']!=1 else ''} restante{'s' if m['pack_left']!=1 else ''} de {m['pack_total']}",
+                f"Pack · {credits_info}{expiry_info}",
                 'Ofrecer renovación de pack — hablar en la próxima clase',
                 3))
+
+        # ── 5b. SUSCRIPCIÓN CADUCA SIN PM ────────────────────────────────────
+        if m['has_subscription'] and not m['has_pm'] and m['renewal_days'] is not None and m['renewal_days'] <= 7:
+            key = f"{email}_caduca_sin_pm"
+            if key not in seen:
+                seen.add(key)
+                t = task('caduca_sin_pm',
+                    f"Suscripción caduca en {m['renewal_days']}d · sin método de pago",
+                    'URGENTE — Conseguir método de pago antes de la renovación',
+                    1, sd=m['renewal_days'])
+                if m['renewal_days'] == 0:
+                    today_tasks.append(t)
+                else:
+                    week_tasks.append(t)
+
+        # ── 5c. PAGO FALLIDO ─────────────────────────────────────────────────
+        if m.get('declined_renewal'):
+            key = f"{email}_pago_fallido"
+            if key not in seen:
+                seen.add(key)
+                t = task('pago_fallido',
+                    f"Renovación fallida · {m['membership_summary'].split('·')[0].strip()}",
+                    'Contactar para resolver el pago — llamar o WhatsApp',
+                    1, sd=0)
+                today_tasks.append(t)
 
         # ── 6. INTRO JOURNEY ─────────────────────────────────────────────────
         if m['has_intro'] and m['intro_used'] >= 1:
@@ -688,6 +722,8 @@ tr:hover td{{background:#fafafa}}
         <button class="fb" onclick="fl('t','pm_hoy',this)">💳 Pedir PM</button>
         <button class="fb" onclick="fl('t','pack_expirando',this)">Pack</button>
         <button class="fb" onclick="fl('t','intro_journey',this)">Intro</button>
+        <button class="fb" onclick="fl('t','pago_fallido',this)">🔴 Pago fallido</button>
+        <button class="fb" onclick="fl('t','caduca_sin_pm',this)">⚠️ Caduca</button>
       </div>
       <div class="task-list" id="list-hoy"></div>
     </div>
@@ -703,6 +739,8 @@ tr:hover td{{background:#fafafa}}
         <button class="fb" onclick="fl('w','sin_pm',this)">💳 Sin PM</button>
         <button class="fb" onclick="fl('w','pack_expirando',this)">Pack</button>
         <button class="fb" onclick="fl('w','intro_journey',this)">Intro</button>
+        <button class="fb" onclick="fl('w','caduca_sin_pm',this)">⚠️ Caduca</button>
+        <button class="fb" onclick="fl('w','pago_fallido',this)">🔴 Pago fallido</button>
         <button class="fb" onclick="fl('w','bienvenida',this)">👋 Nuevos</button>
       </div>
       <div class="task-list" id="list-semana"></div>
@@ -840,6 +878,8 @@ const TM={{
   sin_pm:{{label:'⚠️ Sin método',pill:'tp-warn',cls:'t-warn',acls:'warn'}},
   pack_expirando:{{label:'Pack acaba',pill:'tp-info',cls:'t-info',acls:'info'}},
   intro_journey:{{label:'Intro Journey',pill:'tp-info',cls:'t-info',acls:'info'}},
+  caduca_sin_pm:{{label:'⚠️ Caduca sin PM',pill:'tp-urg',cls:'t-urgent',acls:'urg'}},
+  pago_fallido:{{label:'🔴 Pago fallido',pill:'tp-urg',cls:'t-urgent',acls:'urg'}},
 }};
 
 function notesHTML(notes){{
@@ -1051,14 +1091,16 @@ def main():
     all_members = fetch_all_members(token)
     print(f'✅ {len(all_members)} members')
 
-    # Filter relevant
+    # Filter relevant - include anyone with visits or relevant tags
     RELEVANT = {'Member','FORMER MEMBER','member potencial','introjourney',
                 'DUCK','INFLU','MANUAL','CASH','PAGO FALLIDO','NO CANCELAR!'}
     relevant = []
     for m in all_members:
         tag_set = {t['name'] for t in m.get('customerTags', [])}
-        visits = (m.get('visits') or {}).get('bookingsVisits', 0) or 0
-        if bool(tag_set & RELEVANT) or visits >= 3:
+        visits_total = (m.get('visits') or {}).get('total', 0) or 0
+        visits_real = (m.get('visits') or {}).get('bookingsVisits', 0) or 0
+        # Include if has relevant tag OR has any visits (lower threshold to catch all members)
+        if bool(tag_set & RELEVANT) or visits_real >= 1 or visits_total >= 2:
             relevant.append(m)
     print(f'   {len(relevant)} relevantes')
 
